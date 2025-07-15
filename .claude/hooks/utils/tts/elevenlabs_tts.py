@@ -67,7 +67,7 @@ def main():
             Britney = "6HWqrqOzDfj3UnywjJoZ"
             audio = elevenlabs.text_to_speech.convert(
                 text=text,
-                voice_id = Cornelius,
+                voice_id = Britney,
                 model_id="eleven_turbo_v2_5",
                 output_format="mp3_44100_128",
             )

@@ -123,4 +123,6 @@ dev-debug.log
 # tasks/ 
 
 # Claude Code session files
-.claude/commands/session-*.md
+.claude/commands/session-git
+.cursor
+

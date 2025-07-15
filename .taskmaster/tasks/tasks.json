@@ -30,7 +30,7 @@
             "description": "Create extract_text_from_response() function to handle string, dict, and list response formats",
             "dependencies": [],
             "details": "Develop the core extraction logic in text_processor.py that can intelligently extract text content from different response types. Handle string responses directly, extract values from dictionary responses (checking for common keys like 'content', 'text', 'message', 'output'), and concatenate list items. Include type checking and safe extraction with fallbacks.",
-            "status": "pending",
+            "status": "done",
             "testStrategy": ""
           },
           {
@@ -39,7 +39,7 @@
             "description": "Create word_count() function using regex pattern r'\\S+' for accurate counting",
             "dependencies": [],
             "details": "Implement the word counting function using the regex pattern r'\\S+' to match sequences of non-whitespace characters. This approach correctly handles multiline content, special characters, punctuation, and various whitespace types. The function should return an integer count of words found in the input text.",
-            "status": "pending",
+            "status": "done",
             "testStrategy": ""
           },
           {
@@ -48,7 +48,7 @@
             "description": "Implement strip_ansi_codes() function to clean terminal output",
             "dependencies": [],
             "details": "Develop a function that removes ANSI escape sequences from text using regex pattern matching. The pattern should match sequences like \\x1b[...m for colors and formatting, as well as other ANSI control sequences. This ensures clean text for both word counting and TTS processing.",
-            "status": "pending",
+            "status": "done",
             "testStrategy": ""
           },
           {
@@ -1263,7 +1263,7 @@
     ],
     "metadata": {
       "created": "2025-07-15T19:44:16.184Z",
-      "updated": "2025-07-15T20:10:35.205Z",
+      "updated": "2025-07-15T20:29:43.909Z",
       "description": "Tasks for master context"
     }
   }

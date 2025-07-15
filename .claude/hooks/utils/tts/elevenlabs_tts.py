@@ -29,10 +29,10 @@ def main():
     - Stable production model
     - Cost-effective for high-volume usage
     """
-    
+
     # Load environment variables
     load_dotenv()
-    
+
     # Get API key from environment
     api_key = os.getenv('ELEVENLABS_API_KEY')
     if not api_key:
@@ -40,42 +40,45 @@ def main():
         print("Please add your ElevenLabs API key to .env file:")
         print("ELEVENLABS_API_KEY=your_api_key_here")
         sys.exit(1)
-    
+
     try:
         from elevenlabs.client import ElevenLabs
         from elevenlabs import play
-        
+
         # Initialize client
         elevenlabs = ElevenLabs(api_key=api_key)
-        
+
         print("🎙️  ElevenLabs Turbo v2.5 TTS")
         print("=" * 40)
-        
+
         # Get text from command line argument or use default
         if len(sys.argv) > 1:
             text = " ".join(sys.argv[1:])  # Join all arguments as text
         else:
             text = "The first move is what sets everything in motion."
-        
+
         print(f"🎯 Text: {text}")
         print("🔊 Generating and playing...")
-        
+
         try:
             # Generate and play audio directly
+            David = "jvcMcno3QtjOzGtfpjoI"
+            Cornelius = "6sFKzaJr574YWVu4UuJF"
+            Britney = "6HWqrqOzDfj3UnywjJoZ"
             audio = elevenlabs.text_to_speech.convert(
                 text=text,
-                voice_id="WejK3H1m7MI9CHnIjW9K",  # Specified voice
+                voice_id = Cornelius,
                 model_id="eleven_turbo_v2_5",
                 output_format="mp3_44100_128",
             )
-            
+
             play(audio)
             print("✅ Playback complete!")
-            
+
         except Exception as e:
             print(f"❌ Error: {e}")
-        
-        
+
+
     except ImportError:
         print("❌ Error: elevenlabs package not installed")
         print("This script uses UV to auto-install dependencies.")

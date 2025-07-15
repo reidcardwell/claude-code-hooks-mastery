@@ -59,7 +59,7 @@
               2
             ],
             "details": "Build a function that uses the word_count() function to determine if text meets the configured word count threshold (default 20 words). The function should accept the text and threshold as parameters, returning a boolean. Include logic to handle empty text and ensure ANSI codes are stripped before counting.",
-            "status": "pending",
+            "status": "done",
             "testStrategy": ""
           },
           {
@@ -1263,7 +1263,7 @@
     ],
     "metadata": {
       "created": "2025-07-15T19:44:16.184Z",
-      "updated": "2025-07-15T20:29:43.909Z",
+      "updated": "2025-07-15T20:35:09.973Z",
       "description": "Tasks for master context"
     }
   }

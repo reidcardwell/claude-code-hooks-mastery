@@ -200,6 +200,35 @@ def word_count(text: Optional[str]) -> int:
     return len(words)
 
 
+def is_concise_output(text: Optional[str], threshold: int = 20) -> bool:
+    """
+    Check if text meets word count threshold for TTS eligibility.
+    
+    This function determines if tool output should be spoken by:
+    - Stripping ANSI codes for clean text
+    - Counting words using accurate regex pattern
+    - Comparing against configurable threshold
+    
+    Args:
+        text: Input text to check (tool response content)
+        threshold: Maximum word count for concise output (default: 20)
+        
+    Returns:
+        True if text is concise enough for TTS (≤ threshold words), False otherwise
+    """
+    if not text:
+        return False
+    
+    # Strip ANSI codes first to get clean text for counting
+    clean_text = strip_ansi_codes(text)
+    
+    # Count words in clean text
+    word_count_result = word_count(clean_text)
+    
+    # Check if within threshold
+    return word_count_result <= threshold
+
+
 if __name__ == "__main__":
     # Test the functions with some examples
     test_cases = [
@@ -276,4 +305,31 @@ if __name__ == "__main__":
         count = word_count(test_text)
         print(f"{i:2d}. Input: {repr(test_text)}")
         print(f"    Word count: {count}")
+        print()
+    
+    # Test concise output checking function
+    concise_test_cases = [
+        ("Short text", 20),
+        ("This is a longer sentence with more than twenty words that should not be considered concise", 20),
+        ("Exactly twenty words: a b c d e f g h i j k l m n o p q r s t", 20),
+        ("Twenty one words: a b c d e f g h i j k l m n o p q r s t u", 20),
+        ("\x1b[31mColored text\x1b[0m with ANSI codes", 20),
+        ("", 20),
+        (None, 20),
+        ("Custom threshold test", 5),
+        ("This exceeds custom threshold", 5),
+        ("   \n\t   ", 20),  # Only whitespace
+        ("Command completed successfully", 20),  # Typical TTS message
+        ("File not found: /path/to/nonexistent/file.txt", 20),  # Error message
+    ]
+    
+    print("\nTesting is_concise_output:")
+    print("=" * 50)
+    
+    for i, (test_text, threshold) in enumerate(concise_test_cases, 1):
+        result = is_concise_output(test_text, threshold)
+        word_count_result = word_count(strip_ansi_codes(test_text)) if test_text else 0
+        print(f"{i:2d}. Input: {repr(test_text)} (threshold: {threshold})")
+        print(f"    Word count: {word_count_result}")
+        print(f"    Is concise: {result}")
         print()

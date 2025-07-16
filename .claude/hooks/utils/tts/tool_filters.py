@@ -265,6 +265,292 @@ class ToolFilter(ABC):
             return template
 
 
+class BashFilter(ToolFilter):
+    """
+    Filter for Bash command outputs with intelligent exit code handling.
+    
+    This filter provides specialized behavior for Bash tool responses by:
+    - Analyzing exit codes to determine TTS eligibility
+    - Generating appropriate messages for success/failure scenarios
+    - Filtering out common silent commands that don't need TTS
+    - Providing context-aware error messages
+    """
+    
+    # Commands that should remain silent even on success
+    SILENT_COMMANDS = {
+        'cd', 'export', 'alias', 'unalias', 'set', 'unset', 'source', '.',
+        'ulimit', 'umask', 'history', 'fc', 'jobs', 'bg', 'fg', 'disown',
+        'suspend', 'times', 'type', 'which', 'command', 'builtin', 'enable',
+        'pwd', 'dirs', 'pushd', 'popd', 'readonly', 'declare', 'typeset',
+        'local', 'eval', 'exec', 'shift', 'getopts', 'wait', 'trap',
+        'shopt', 'complete', 'compgen', 'bind', 'hash', 'help'
+    }
+    
+    def __init__(self):
+        """Initialize BashFilter with default configuration."""
+        super().__init__()
+        self.speak_success = True  # Can be configured via settings
+        self.speak_errors = True   # Can be configured via settings
+    
+    def should_speak(self, tool_name: str, response_data: Any) -> bool:
+        """
+        Determine if Bash command output should trigger TTS.
+        
+        Logic:
+        - Always speak on errors (exit_code != 0)
+        - For success (exit_code == 0), speak only if:
+          * Command is not in SILENT_COMMANDS list
+          * Command produced meaningful output
+          * speak_success is enabled
+        
+        Args:
+            tool_name: Should be "Bash"
+            response_data: Bash command response data
+            
+        Returns:
+            bool: True if output should trigger TTS
+        """
+        if not self.speak_errors and not self.speak_success:
+            return False
+        
+        parsed = self._parse_response_data(response_data)
+        
+        # Get exit code (default to 0 if not present)
+        exit_code = parsed.get("exit_code", 0)
+        
+        # Always speak on errors if enabled
+        if exit_code != 0:
+            return self.speak_errors
+        
+        # For successful commands, check if we should speak
+        if not self.speak_success:
+            return False
+        
+        # Check if command should be silent
+        if self._is_silent_command(parsed):
+            return False
+        
+        # Check if there's meaningful output to speak
+        return self._has_meaningful_output(parsed)
+    
+    def get_custom_message(self, tool_name: str, response_data: Any) -> Optional[str]:
+        """
+        Generate custom TTS message for Bash command output.
+        
+        Creates context-aware messages based on:
+        - Exit code and error conditions
+        - Command type and expected output
+        - Actual command output content
+        
+        Args:
+            tool_name: Should be "Bash"
+            response_data: Bash command response data
+            
+        Returns:
+            Optional[str]: Custom message for TTS, or None for default processing
+        """
+        parsed = self._parse_response_data(response_data)
+        exit_code = parsed.get("exit_code", 0)
+        
+        # Handle error cases
+        if exit_code != 0:
+            return self._generate_error_message(parsed, exit_code)
+        
+        # Handle success cases
+        return self._generate_success_message(parsed)
+    
+    def _is_silent_command(self, parsed_data: Dict[str, Any]) -> bool:
+        """
+        Check if the command should remain silent even on success.
+        
+        Args:
+            parsed_data: Normalized response data
+            
+        Returns:
+            bool: True if command should be silent
+        """
+        # Try to extract command from various possible fields
+        command = self._extract_command(parsed_data)
+        
+        if not command:
+            return False
+        
+        # Get the base command (first word)
+        base_command = command.split()[0] if command.split() else ""
+        
+        # Remove path prefixes to get actual command name
+        base_command = base_command.split('/')[-1]
+        
+        return base_command in self.SILENT_COMMANDS
+    
+    def _extract_command(self, parsed_data: Dict[str, Any]) -> Optional[str]:
+        """
+        Extract the actual command that was executed.
+        
+        Args:
+            parsed_data: Normalized response data
+            
+        Returns:
+            Optional[str]: The command that was executed, or None if not found
+        """
+        # Check various fields where command might be stored
+        command_fields = ["command", "cmd", "description", "input"]
+        
+        for field in command_fields:
+            if field in parsed_data and isinstance(parsed_data[field], str):
+                return parsed_data[field].strip()
+        
+        return None
+    
+    def _has_meaningful_output(self, parsed_data: Dict[str, Any]) -> bool:
+        """
+        Check if the command produced meaningful output worth speaking.
+        
+        Args:
+            parsed_data: Normalized response data
+            
+        Returns:
+            bool: True if output is meaningful
+        """
+        # Extract text content
+        text_content = self._extract_text_content(parsed_data)
+        
+        if not text_content or not text_content.strip():
+            return False
+        
+        # Check if output is just whitespace or very short
+        cleaned_output = text_content.strip()
+        if len(cleaned_output) < 3:
+            return False
+        
+        # Check for common meaningless outputs
+        meaningless_patterns = [
+            r'^\s*$',                    # Empty or whitespace only
+            r'^\.+$',                    # Just dots
+            r'^\s*ok\s*$',              # Just "ok"
+            r'^\s*done\s*$',            # Just "done"
+            r'^\s*[0-9]+\s*$',          # Just numbers
+        ]
+        
+        for pattern in meaningless_patterns:
+            if re.match(pattern, cleaned_output, re.IGNORECASE):
+                return False
+        
+        return True
+    
+    def _generate_error_message(self, parsed_data: Dict[str, Any], exit_code: int) -> str:
+        """
+        Generate appropriate error message based on exit code and context.
+        
+        Args:
+            parsed_data: Normalized response data
+            exit_code: Command exit code
+            
+        Returns:
+            str: Error message for TTS
+        """
+        # Get command for context
+        command = self._extract_command(parsed_data)
+        command_name = command.split()[0].split('/')[-1] if command else "Command"
+        
+        # Common exit code meanings
+        exit_code_messages = {
+            1: "Command failed",
+            2: "Command usage error",
+            126: "Command not executable",
+            127: "Command not found",
+            128: "Invalid exit argument",
+            130: "Command interrupted",
+            255: "Command exit status out of range"
+        }
+        
+        # Get specific message for exit code
+        if exit_code in exit_code_messages:
+            base_message = exit_code_messages[exit_code]
+        else:
+            base_message = f"Command failed with exit code {exit_code}"
+        
+        # Try to include error output if available
+        error_output = self._extract_error_output(parsed_data)
+        if error_output and len(error_output) < 100:  # Keep it concise
+            return f"{base_message}: {error_output}"
+        
+        return base_message
+    
+    def _generate_success_message(self, parsed_data: Dict[str, Any]) -> Optional[str]:
+        """
+        Generate appropriate success message for completed commands.
+        
+        Args:
+            parsed_data: Normalized response data
+            
+        Returns:
+            Optional[str]: Success message for TTS, or None for default processing
+        """
+        # Get command for context
+        command = self._extract_command(parsed_data)
+        
+        if not command:
+            return "Command completed successfully"
+        
+        # Get base command name
+        base_command = command.split()[0].split('/')[-1]
+        
+        # Context-aware success messages for common commands
+        success_messages = {
+            'mkdir': "Directory created successfully",
+            'rmdir': "Directory removed successfully",
+            'rm': "File removed successfully",
+            'cp': "File copied successfully",
+            'mv': "File moved successfully",
+            'ln': "Link created successfully",
+            'chmod': "Permissions changed successfully",
+            'chown': "Ownership changed successfully",
+            'tar': "Archive operation completed",
+            'gzip': "File compressed successfully",
+            'gunzip': "File decompressed successfully",
+            'wget': "Download completed successfully",
+            'curl': "Request completed successfully",
+            'ssh': "SSH connection established",
+            'scp': "File transfer completed successfully",
+            'rsync': "Synchronization completed successfully",
+            'make': "Build completed successfully",
+            'pip': "Package operation completed successfully",
+            'npm': "Package operation completed successfully",
+            'yarn': "Package operation completed successfully",
+            'docker': "Docker operation completed successfully",
+            'git': "Git operation completed successfully",
+        }
+        
+        # Return specific message if available
+        if base_command in success_messages:
+            return success_messages[base_command]
+        
+        # Default success message
+        return "Command completed successfully"
+    
+    def _extract_error_output(self, parsed_data: Dict[str, Any]) -> Optional[str]:
+        """
+        Extract error output from response data.
+        
+        Args:
+            parsed_data: Normalized response data
+            
+        Returns:
+            Optional[str]: Error output text, or None if not found
+        """
+        # Check various fields where error output might be stored
+        error_fields = ["stderr", "error", "error_output", "error_message"]
+        
+        for field in error_fields:
+            if field in parsed_data and isinstance(parsed_data[field], str):
+                error_text = parsed_data[field].strip()
+                if error_text:
+                    return error_text
+        
+        return None
+
+
 class DefaultToolFilter(ToolFilter):
     """
     Default implementation of ToolFilter for tools without specific filters.
@@ -298,49 +584,90 @@ class DefaultToolFilter(ToolFilter):
 
 
 if __name__ == "__main__":
-    # Test the base class implementation
-    print("Testing ToolFilter base class...")
+    # Test both base class and BashFilter implementation
+    print("Testing ToolFilter base class and BashFilter...")
     
     # Test default filter
     default_filter = DefaultToolFilter()
     print(f"Default filter tool name: {default_filter.get_tool_name()}")
     
-    # Test response parsing
-    test_cases = [
-        "simple string",
-        {"exit_code": 0, "output": "Success"},
-        {"exit_code": 1, "error": "Failed"},
-        ["item1", "item2", "item3"],
+    # Test BashFilter
+    bash_filter = BashFilter()
+    print(f"Bash filter tool name: {bash_filter.get_tool_name()}")
+    
+    # Test cases for BashFilter
+    bash_test_cases = [
+        # Success cases
+        {"exit_code": 0, "command": "ls -la", "output": "total 64\ndrwxr-xr-x  3 user  staff   96 Jul 16 08:00 .\n"},
+        {"exit_code": 0, "command": "mkdir test_dir", "output": ""},
+        {"exit_code": 0, "command": "cd /tmp", "output": ""},
+        {"exit_code": 0, "command": "pwd", "output": "/tmp"},
+        {"exit_code": 0, "command": "echo 'Hello World'", "output": "Hello World"},
+        
+        # Error cases
+        {"exit_code": 1, "command": "ls /nonexistent", "stderr": "ls: /nonexistent: No such file or directory"},
+        {"exit_code": 127, "command": "nonexistentcommand", "stderr": "nonexistentcommand: command not found"},
+        {"exit_code": 2, "command": "grep", "stderr": "usage: grep pattern file"},
+        
+        # Edge cases
+        {"exit_code": 0, "command": "make", "output": "gcc -o program program.c\nBuild successful"},
+        {"exit_code": 0, "command": "/usr/bin/git status", "output": "On branch main\nnothing to commit"},
         None,
-        123
+        "simple string output",
+        {"exit_code": 0, "output": "ok"},
+        {"exit_code": 0, "output": "done"},
     ]
     
-    print("\nTesting response parsing:")
-    for i, test_case in enumerate(test_cases, 1):
-        parsed = default_filter._parse_response_data(test_case)
-        text_content = default_filter._extract_text_content(test_case)
-        is_error = default_filter._is_error_response(test_case)
-        should_speak = default_filter.should_speak("Test", test_case)
+    print("\nTesting BashFilter with various scenarios:")
+    for i, test_case in enumerate(bash_test_cases, 1):
+        should_speak = bash_filter.should_speak("Bash", test_case)
+        custom_message = bash_filter.get_custom_message("Bash", test_case)
         
         print(f"{i}. Input: {test_case}")
-        print(f"   Parsed: {parsed}")
-        print(f"   Text content: {text_content}")
-        print(f"   Is error: {is_error}")
         print(f"   Should speak: {should_speak}")
+        print(f"   Custom message: {custom_message}")
         print()
     
-    # Test message formatting
-    print("Testing message formatting:")
-    template = "Command {action} {status}"
-    formatted = default_filter._format_message(template, action="completed", status="successfully")
-    print(f"Template: {template}")
-    print(f"Formatted: {formatted}")
+    # Test silent commands detection
+    print("Testing silent commands detection:")
+    silent_test_cases = [
+        {"exit_code": 0, "command": "cd /home/user", "output": ""},
+        {"exit_code": 0, "command": "export PATH=/usr/bin:$PATH", "output": ""},
+        {"exit_code": 0, "command": "source ~/.bashrc", "output": ""},
+        {"exit_code": 0, "command": "alias ll='ls -la'", "output": ""},
+        {"exit_code": 0, "command": "history", "output": "1  ls\n2  cd /tmp\n3  pwd"},
+    ]
     
-    # Test with missing variables
-    try:
-        formatted_incomplete = default_filter._format_message(template, action="completed")
-        print(f"Incomplete formatting: {formatted_incomplete}")
-    except Exception as e:
-        print(f"Error handling: {e}")
+    for i, test_case in enumerate(silent_test_cases, 1):
+        should_speak = bash_filter.should_speak("Bash", test_case)
+        print(f"{i}. Command: {test_case.get('command', 'N/A')} -> Should speak: {should_speak}")
     
-    print("\nToolFilter base class implementation complete!")
+    # Test error message generation
+    print("\nTesting error message generation:")
+    error_test_cases = [
+        {"exit_code": 1, "command": "ls /nonexistent", "stderr": "ls: /nonexistent: No such file or directory"},
+        {"exit_code": 127, "command": "badcommand", "stderr": "badcommand: command not found"},
+        {"exit_code": 2, "command": "grep", "stderr": "usage: grep pattern file"},
+        {"exit_code": 130, "command": "sleep 100", "stderr": "Interrupted"},
+    ]
+    
+    for i, test_case in enumerate(error_test_cases, 1):
+        error_message = bash_filter._generate_error_message(bash_filter._parse_response_data(test_case), test_case["exit_code"])
+        print(f"{i}. Exit code {test_case['exit_code']}: {error_message}")
+    
+    # Test success message generation
+    print("\nTesting success message generation:")
+    success_test_cases = [
+        {"exit_code": 0, "command": "mkdir test_dir"},
+        {"exit_code": 0, "command": "rm test_file.txt"},
+        {"exit_code": 0, "command": "cp source.txt dest.txt"},
+        {"exit_code": 0, "command": "npm install package"},
+        {"exit_code": 0, "command": "git commit -m 'message'"},
+        {"exit_code": 0, "command": "customcommand --flag"},
+    ]
+    
+    for i, test_case in enumerate(success_test_cases, 1):
+        success_message = bash_filter._generate_success_message(bash_filter._parse_response_data(test_case))
+        print(f"{i}. Command: {test_case['command']} -> {success_message}")
+    
+    print("\nBashFilter implementation testing complete!")

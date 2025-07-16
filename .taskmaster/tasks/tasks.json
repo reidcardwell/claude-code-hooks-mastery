@@ -120,7 +120,7 @@
               1
             ],
             "details": "Inherit from ToolFilter. Parse Bash response to extract exit_code field. Implement logic: speak if exit_code != 0, generate custom error messages based on exit codes (e.g., 'Command failed with error code X'). For exit_code == 0, return 'Command completed successfully' only for significant commands. Filter out common silent commands like 'cd', 'export', etc.",
-            "status": "pending",
+            "status": "done",
             "testStrategy": ""
           },
           {
@@ -1263,7 +1263,7 @@
     ],
     "metadata": {
       "created": "2025-07-15T19:44:16.184Z",
-      "updated": "2025-07-16T12:45:39.946Z",
+      "updated": "2025-07-16T13:03:00.439Z",
       "description": "Tasks for master context"
     }
   }

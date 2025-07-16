@@ -123,12 +123,16 @@ def announce_completion():
         completion_message = get_llm_completion_message()
         
         # Call the TTS script with the completion message
-        subprocess.run([
+        result = subprocess.run([
             "uv", "run", tts_script, completion_message
         ], 
-        capture_output=True,  # Suppress output
+        capture_output=False,  # Don't suppress output for debugging
         timeout=10  # 10-second timeout
         )
+        
+        # Log result for debugging
+        with open("logs/tts_debug.log", "a") as f:
+            f.write(f"{datetime.now()}: TTS result code: {result.returncode}, script: {tts_script}, message: {completion_message}\n")
         
     except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
         # Fail silently if TTS encounters issues

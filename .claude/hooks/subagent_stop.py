@@ -112,7 +112,7 @@ def main():
         with open(log_path, 'w') as f:
             json.dump(log_data, f, indent=2)
         
-        # Handle --chat switch (same as stop.py)
+        # Handle --chat switch (same as stop.py.disabled)
         if args.chat and 'transcript_path' in input_data:
             transcript_path = input_data['transcript_path']
             if os.path.exists(transcript_path):

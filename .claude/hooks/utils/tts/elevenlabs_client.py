@@ -41,6 +41,10 @@ from requests.adapters import HTTPAdapter
 import weakref
 import random
 import math
+import platform
+import subprocess
+import tempfile
+import io
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -115,6 +119,24 @@ class QueueOverflowStrategy(Enum):
     DROP_LOWEST_PRIORITY = "drop_lowest_priority"
     REJECT = "reject"
     BLOCK = "block"
+
+
+class AudioFormat(Enum):
+    """Supported audio formats."""
+    MP3 = "mp3"
+    WAV = "wav"
+    OGG = "ogg"
+    FLAC = "flac"
+    AAC = "aac"
+
+
+class PlaybackStatus(Enum):
+    """Audio playback status."""
+    IDLE = "idle"
+    PLAYING = "playing"
+    PAUSED = "paused"
+    STOPPED = "stopped"
+    ERROR = "error"
 
 
 @dataclass
@@ -1094,6 +1116,397 @@ class RateLimitManager:
 
 
 @dataclass
+class AudioPlayerConfig:
+    """Configuration for audio playback."""
+    volume: float = 1.0  # 0.0 to 1.0
+    playback_device: Optional[str] = None
+    buffer_size: int = 4096
+    enable_interruption: bool = True
+    temp_dir: Optional[str] = None
+    cleanup_temp_files: bool = True
+    playback_timeout: float = 30.0
+    
+    def __post_init__(self):
+        if not 0.0 <= self.volume <= 1.0:
+            raise ValueError("Volume must be between 0.0 and 1.0")
+        if self.temp_dir is None:
+            self.temp_dir = tempfile.gettempdir()
+
+
+class AudioPlayer:
+    """Cross-platform audio playback engine."""
+    
+    def __init__(self, config: AudioPlayerConfig = None):
+        self.config = config or AudioPlayerConfig()
+        self.status = PlaybackStatus.IDLE
+        self.current_process: Optional[subprocess.Popen] = None
+        self.lock = threading.RLock()
+        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        
+        # Platform detection
+        self.platform = platform.system().lower()
+        self.logger.info(f"Detected platform: {self.platform}")
+        
+        # Initialize platform-specific settings
+        self._init_platform_settings()
+    
+    def _init_platform_settings(self):
+        """Initialize platform-specific playback settings."""
+        if self.platform == "darwin":  # macOS
+            self.playback_command = "afplay"
+            self.command_args = ["-v", str(self.config.volume)]
+        elif self.platform == "windows":
+            # Windows - try different options
+            self.playback_command = self._find_windows_player()
+            self.command_args = []
+        elif self.platform == "linux":
+            # Linux - try different audio systems
+            self.playback_command = self._find_linux_player()
+            self.command_args = []
+        else:
+            self.logger.warning(f"Unsupported platform: {self.platform}")
+            self.playback_command = None
+            self.command_args = []
+    
+    def _find_windows_player(self) -> Optional[str]:
+        """Find available audio player on Windows."""
+        # Check for common Windows audio players
+        players = ["powershell", "winsound"]  # powershell for built-in audio
+        
+        for player in players:
+            try:
+                result = subprocess.run(
+                    ["where", player], 
+                    capture_output=True, 
+                    text=True, 
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    self.logger.info(f"Found Windows audio player: {player}")
+                    return player
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                continue
+        
+        self.logger.warning("No suitable Windows audio player found")
+        return None
+    
+    def _find_linux_player(self) -> Optional[str]:
+        """Find available audio player on Linux."""
+        # Check for common Linux audio players
+        players = ["aplay", "paplay", "ffplay", "mpg123", "sox"]
+        
+        for player in players:
+            try:
+                result = subprocess.run(
+                    ["which", player], 
+                    capture_output=True, 
+                    text=True, 
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    self.logger.info(f"Found Linux audio player: {player}")
+                    return player
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                continue
+        
+        self.logger.warning("No suitable Linux audio player found")
+        return None
+    
+    def _create_temp_audio_file(self, audio_data: bytes, format: AudioFormat = AudioFormat.MP3) -> str:
+        """Create temporary audio file from audio data."""
+        with tempfile.NamedTemporaryFile(
+            suffix=f".{format.value}",
+            dir=self.config.temp_dir,
+            delete=False
+        ) as temp_file:
+            temp_file.write(audio_data)
+            temp_path = temp_file.name
+        
+        self.logger.debug(f"Created temp audio file: {temp_path}")
+        return temp_path
+    
+    def _cleanup_temp_file(self, file_path: str):
+        """Clean up temporary audio file."""
+        if self.config.cleanup_temp_files:
+            try:
+                os.unlink(file_path)
+                self.logger.debug(f"Cleaned up temp file: {file_path}")
+            except OSError as e:
+                self.logger.warning(f"Failed to cleanup temp file {file_path}: {e}")
+    
+    def _play_macos(self, file_path: str) -> subprocess.Popen:
+        """Play audio on macOS using afplay."""
+        cmd = [self.playback_command] + self.command_args + [file_path]
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+    
+    def _play_windows(self, file_path: str) -> subprocess.Popen:
+        """Play audio on Windows using PowerShell."""
+        if self.playback_command == "powershell":
+            # Use PowerShell to play audio
+            powershell_cmd = f'''
+            Add-Type -AssemblyName presentationCore
+            $mediaPlayer = New-Object System.Windows.Media.MediaPlayer
+            $mediaPlayer.Open([System.Uri]::new("{file_path}"))
+            $mediaPlayer.Volume = {self.config.volume}
+            $mediaPlayer.Play()
+            Start-Sleep -Seconds 1
+            while($mediaPlayer.NaturalDuration.HasTimeSpan -eq $false) {{
+                Start-Sleep -Milliseconds 100
+            }}
+            $duration = $mediaPlayer.NaturalDuration.TimeSpan.TotalSeconds
+            Start-Sleep -Seconds $duration
+            $mediaPlayer.Stop()
+            '''
+            return subprocess.Popen(
+                ["powershell", "-Command", powershell_cmd],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+        else:
+            # Fallback to generic command
+            return subprocess.Popen(
+                [self.playback_command, file_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+    
+    def _play_linux(self, file_path: str) -> subprocess.Popen:
+        """Play audio on Linux using available player."""
+        cmd = [self.playback_command]
+        
+        # Add volume control if supported
+        if self.playback_command == "aplay":
+            # aplay doesn't support volume directly, need to use amixer
+            pass
+        elif self.playback_command == "paplay":
+            cmd.extend(["--volume", str(int(self.config.volume * 65536))])
+        elif self.playback_command == "ffplay":
+            cmd.extend(["-nodisp", "-autoexit", "-volume", str(int(self.config.volume * 100))])
+        elif self.playback_command == "mpg123":
+            cmd.extend(["-q", "--gain", str(int(self.config.volume * 100))])
+        
+        cmd.append(file_path)
+        
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+    
+    def play_audio(self, audio_data: bytes, format: AudioFormat = AudioFormat.MP3, blocking: bool = True) -> bool:
+        """
+        Play audio data.
+        
+        Args:
+            audio_data: Raw audio data bytes
+            format: Audio format of the data
+            blocking: Whether to block until playback completes
+            
+        Returns:
+            bool: True if playback started successfully, False otherwise
+        """
+        with self.lock:
+            if self.status == PlaybackStatus.PLAYING:
+                self.logger.warning("Already playing audio - stopping current playback")
+                self.stop_playback()
+            
+            if not self.playback_command:
+                self.logger.error(f"No audio player available for platform: {self.platform}")
+                self.status = PlaybackStatus.ERROR
+                return False
+            
+            try:
+                # Create temporary file
+                temp_file = self._create_temp_audio_file(audio_data, format)
+                
+                # Start playback based on platform
+                if self.platform == "darwin":
+                    process = self._play_macos(temp_file)
+                elif self.platform == "windows":
+                    process = self._play_windows(temp_file)
+                elif self.platform == "linux":
+                    process = self._play_linux(temp_file)
+                else:
+                    self.logger.error(f"Unsupported platform: {self.platform}")
+                    self._cleanup_temp_file(temp_file)
+                    return False
+                
+                self.current_process = process
+                self.status = PlaybackStatus.PLAYING
+                
+                if blocking:
+                    # Wait for playback to complete
+                    try:
+                        stdout, stderr = process.communicate(timeout=self.config.playback_timeout)
+                        if process.returncode == 0:
+                            self.logger.info("Audio playback completed successfully")
+                            self.status = PlaybackStatus.IDLE
+                        else:
+                            self.logger.error(f"Audio playback failed: {stderr}")
+                            self.status = PlaybackStatus.ERROR
+                    except subprocess.TimeoutExpired:
+                        self.logger.error("Audio playback timed out")
+                        process.kill()
+                        self.status = PlaybackStatus.ERROR
+                    finally:
+                        self.current_process = None
+                        self._cleanup_temp_file(temp_file)
+                else:
+                    # Non-blocking - set up cleanup in background
+                    def cleanup_after_playback():
+                        try:
+                            process.wait(timeout=self.config.playback_timeout)
+                            if process.returncode == 0:
+                                self.status = PlaybackStatus.IDLE
+                            else:
+                                self.status = PlaybackStatus.ERROR
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            self.status = PlaybackStatus.ERROR
+                        finally:
+                            with self.lock:
+                                if self.current_process == process:
+                                    self.current_process = None
+                            self._cleanup_temp_file(temp_file)
+                    
+                    threading.Thread(target=cleanup_after_playback, daemon=True).start()
+                
+                return True
+                
+            except Exception as e:
+                self.logger.error(f"Failed to play audio: {e}")
+                self.status = PlaybackStatus.ERROR
+                return False
+    
+    def stop_playback(self) -> bool:
+        """
+        Stop current audio playback.
+        
+        Returns:
+            bool: True if playback was stopped, False otherwise
+        """
+        with self.lock:
+            if self.current_process and self.current_process.poll() is None:
+                try:
+                    self.current_process.terminate()
+                    self.current_process.wait(timeout=5)
+                    self.logger.info("Audio playback stopped")
+                    self.status = PlaybackStatus.STOPPED
+                    return True
+                except subprocess.TimeoutExpired:
+                    self.current_process.kill()
+                    self.logger.warning("Audio playback forcefully killed")
+                    self.status = PlaybackStatus.STOPPED
+                    return True
+                except Exception as e:
+                    self.logger.error(f"Failed to stop playback: {e}")
+                    return False
+            else:
+                self.logger.info("No active playback to stop")
+                return True
+    
+    def pause_playback(self) -> bool:
+        """
+        Pause current audio playback.
+        
+        Note: Pause/resume functionality is limited by platform capabilities.
+        Most command-line players don't support pause/resume.
+        
+        Returns:
+            bool: True if playback was paused, False otherwise
+        """
+        # Most command-line audio players don't support pause/resume
+        # This is a placeholder for future implementation with more advanced audio libraries
+        self.logger.warning("Pause functionality not implemented for command-line players")
+        return False
+    
+    def resume_playback(self) -> bool:
+        """
+        Resume paused audio playback.
+        
+        Returns:
+            bool: True if playback was resumed, False otherwise
+        """
+        # Most command-line audio players don't support pause/resume
+        # This is a placeholder for future implementation with more advanced audio libraries
+        self.logger.warning("Resume functionality not implemented for command-line players")
+        return False
+    
+    def set_volume(self, volume: float) -> bool:
+        """
+        Set playback volume.
+        
+        Args:
+            volume: Volume level (0.0 to 1.0)
+            
+        Returns:
+            bool: True if volume was set, False otherwise
+        """
+        if not 0.0 <= volume <= 1.0:
+            raise ValueError("Volume must be between 0.0 and 1.0")
+        
+        self.config.volume = volume
+        self.logger.info(f"Volume set to {volume}")
+        
+        # Update platform-specific command args
+        if self.platform == "darwin":
+            self.command_args = ["-v", str(volume)]
+        
+        return True
+    
+    def get_status(self) -> PlaybackStatus:
+        """Get current playback status."""
+        return self.status
+    
+    def is_playing(self) -> bool:
+        """Check if audio is currently playing."""
+        return self.status == PlaybackStatus.PLAYING
+    
+    def get_supported_formats(self) -> List[AudioFormat]:
+        """Get list of supported audio formats for current platform."""
+        if self.platform == "darwin":
+            # afplay supports most formats
+            return [AudioFormat.MP3, AudioFormat.WAV, AudioFormat.AAC, AudioFormat.FLAC]
+        elif self.platform == "windows":
+            # Windows Media Player supports most formats
+            return [AudioFormat.MP3, AudioFormat.WAV, AudioFormat.AAC]
+        elif self.platform == "linux":
+            # Depends on the player found
+            if self.playback_command == "aplay":
+                return [AudioFormat.WAV]
+            elif self.playback_command == "paplay":
+                return [AudioFormat.WAV, AudioFormat.OGG]
+            elif self.playback_command == "ffplay":
+                return [AudioFormat.MP3, AudioFormat.WAV, AudioFormat.OGG, AudioFormat.FLAC, AudioFormat.AAC]
+            elif self.playback_command == "mpg123":
+                return [AudioFormat.MP3]
+            else:
+                return [AudioFormat.MP3, AudioFormat.WAV]
+        else:
+            return []
+    
+    def health_check(self) -> Dict[str, Any]:
+        """Perform health check on audio player."""
+        return {
+            "status": "healthy" if self.playback_command else "error",
+            "platform": self.platform,
+            "playback_command": self.playback_command,
+            "supported_formats": [f.value for f in self.get_supported_formats()],
+            "current_status": self.status.value,
+            "volume": self.config.volume,
+            "is_playing": self.is_playing()
+        }
+
+
+@dataclass
 class TTSConfig:
     """Configuration settings for TTS client."""
     api_key: str
@@ -1115,6 +1528,9 @@ class TTSConfig:
     
     # Rate limiting configuration
     rate_limit_config: Optional[RateLimitConfig] = None
+    
+    # Audio playback configuration
+    audio_config: Optional[AudioPlayerConfig] = None
     
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -1146,6 +1562,10 @@ class TTSConfig:
                     refill_rate=self.rate_limit_requests / self.rate_limit_window
                 )
             )
+        
+        # Initialize audio configuration if not provided
+        if self.audio_config is None:
+            self.audio_config = AudioPlayerConfig()
 
 
 @dataclass
@@ -1242,6 +1662,9 @@ class TTSClient:
         
         # Initialize rate limiting manager
         self._rate_limit_manager = RateLimitManager(self.config.rate_limit_config)
+        
+        # Initialize audio player
+        self._audio_player = AudioPlayer(self.config.audio_config)
         
         # Thread safety
         self._lock = threading.RLock()
@@ -2111,7 +2534,8 @@ class TTSClient:
                 "config_valid": True,
                 "session_manager_active": self._session_manager is not None,
                 "retry_handler_active": self._retry_handler is not None,
-                "rate_limit_manager_active": self._rate_limit_manager is not None
+                "rate_limit_manager_active": self._rate_limit_manager is not None,
+                "audio_player_active": self._audio_player is not None
             }
             
             # Check session manager health
@@ -2152,6 +2576,17 @@ class TTSClient:
                     health_info["rate_limit_stats"] = {"status": "error"}
                     health_info["status"] = "degraded"
             
+            # Check audio player health
+            if self._audio_player:
+                try:
+                    audio_health = self._audio_player.health_check()
+                    health_info["audio_player_health"] = audio_health
+                    if audio_health["status"] != "healthy":
+                        health_info["status"] = "degraded"
+                except Exception:
+                    health_info["audio_player_health"] = {"status": "error"}
+                    health_info["status"] = "degraded"
+            
             # Check API key
             try:
                 health_info["api_key_valid"] = self.validate_api_key()
@@ -2176,6 +2611,242 @@ class TTSClient:
                 "error": str(e)
             }
     
+    def speak_text(self, text: str, voice_id: str = None, blocking: bool = True, volume: float = None) -> bool:
+        """
+        Synthesize text to speech and play it.
+        
+        Args:
+            text: Text to synthesize
+            voice_id: Voice ID to use (defaults to configured default)
+            blocking: Whether to block until playback completes
+            volume: Volume level (0.0 to 1.0, overrides config)
+            
+        Returns:
+            bool: True if synthesis and playback succeeded
+            
+        Raises:
+            AuthenticationError: If API key is invalid
+            VoiceNotFoundError: If voice ID is not available
+            PlaybackError: If audio playback fails
+            
+        Example:
+            >>> client = TTSClient(api_key="your-api-key")
+            >>> client.speak_text("Hello world", voice_id="David")
+        """
+        try:
+            # Validate input
+            if not text or not text.strip():
+                raise ValueError("Text cannot be empty")
+            
+            # Use default voice if not specified
+            if voice_id is None:
+                voice_id = self.config.default_voice_id
+            
+            # Set volume if provided
+            if volume is not None:
+                self._audio_player.set_volume(volume)
+            
+            self.logger.info(f"Synthesizing text: '{text[:50]}...' with voice: {voice_id}")
+            
+            # Synthesize audio
+            audio_data = self._synthesize_text_to_audio(text, voice_id)
+            
+            # Play audio
+            success = self._audio_player.play_audio(audio_data, AudioFormat.MP3, blocking=blocking)
+            
+            if success:
+                self.logger.info("Text-to-speech playback completed successfully")
+                return True
+            else:
+                raise PlaybackError("Audio playback failed")
+                
+        except Exception as e:
+            self.logger.error(f"Text-to-speech failed: {e}")
+            raise
+    
+    def _synthesize_text_to_audio(self, text: str, voice_id: str) -> bytes:
+        """
+        Synthesize text to audio data using ElevenLabs API.
+        
+        Args:
+            text: Text to synthesize
+            voice_id: Voice ID to use
+            
+        Returns:
+            bytes: Audio data in MP3 format
+            
+        Raises:
+            AuthenticationError: If API key is invalid
+            VoiceNotFoundError: If voice ID is not available
+            TTSError: If synthesis fails
+        """
+        try:
+            # Prepare synthesis request
+            synthesis_data = {
+                "text": text,
+                "model_id": "eleven_monolingual_v1",
+                "voice_settings": {
+                    "stability": 0.75,
+                    "similarity_boost": 0.75,
+                    "style": 0.0,
+                    "use_speaker_boost": True
+                }
+            }
+            
+            # Make API request
+            response = self._make_rate_limited_request(
+                "POST",
+                f"{self.config.base_url}/text-to-speech/{voice_id}",
+                priority=QueuePriority.HIGH,
+                json=synthesis_data,
+                headers={"Accept": "audio/mpeg"},
+                timeout=self.config.timeout
+            )
+            
+            if response.status_code == 200:
+                return response.content
+            elif response.status_code == 404:
+                raise VoiceNotFoundError(f"Voice ID {voice_id} not found")
+            elif response.status_code == 401:
+                raise AuthenticationError("Invalid API key")
+            else:
+                raise TTSError(f"Synthesis failed: HTTP {response.status_code}")
+                
+        except Exception as e:
+            self.logger.error(f"Text synthesis failed: {e}")
+            raise
+    
+    def stop_playback(self) -> bool:
+        """
+        Stop current audio playback.
+        
+        Returns:
+            bool: True if playback was stopped successfully
+            
+        Example:
+            >>> client = TTSClient(api_key="your-api-key")
+            >>> client.speak_text("Hello world", blocking=False)
+            >>> client.stop_playback()
+        """
+        if self._audio_player:
+            return self._audio_player.stop_playback()
+        return False
+    
+    def pause_playback(self) -> bool:
+        """
+        Pause current audio playback.
+        
+        Note: Pause functionality is platform-dependent.
+        
+        Returns:
+            bool: True if playback was paused successfully
+            
+        Example:
+            >>> client = TTSClient(api_key="your-api-key")
+            >>> client.speak_text("Hello world", blocking=False)
+            >>> client.pause_playback()
+        """
+        if self._audio_player:
+            return self._audio_player.pause_playback()
+        return False
+    
+    def resume_playback(self) -> bool:
+        """
+        Resume paused audio playback.
+        
+        Returns:
+            bool: True if playback was resumed successfully
+            
+        Example:
+            >>> client = TTSClient(api_key="your-api-key")
+            >>> client.resume_playback()
+        """
+        if self._audio_player:
+            return self._audio_player.resume_playback()
+        return False
+    
+    def set_volume(self, volume: float) -> bool:
+        """
+        Set audio playback volume.
+        
+        Args:
+            volume: Volume level (0.0 to 1.0)
+            
+        Returns:
+            bool: True if volume was set successfully
+            
+        Example:
+            >>> client = TTSClient(api_key="your-api-key")
+            >>> client.set_volume(0.8)
+        """
+        if self._audio_player:
+            return self._audio_player.set_volume(volume)
+        return False
+    
+    def get_playback_status(self) -> PlaybackStatus:
+        """
+        Get current audio playback status.
+        
+        Returns:
+            PlaybackStatus: Current playback status
+            
+        Example:
+            >>> client = TTSClient(api_key="your-api-key")
+            >>> status = client.get_playback_status()
+            >>> print(f"Status: {status.value}")
+        """
+        if self._audio_player:
+            return self._audio_player.get_status()
+        return PlaybackStatus.ERROR
+    
+    def is_playing(self) -> bool:
+        """
+        Check if audio is currently playing.
+        
+        Returns:
+            bool: True if audio is playing
+            
+        Example:
+            >>> client = TTSClient(api_key="your-api-key")
+            >>> if client.is_playing():
+            ...     print("Audio is playing")
+        """
+        if self._audio_player:
+            return self._audio_player.is_playing()
+        return False
+    
+    def get_supported_audio_formats(self) -> List[AudioFormat]:
+        """
+        Get list of supported audio formats for current platform.
+        
+        Returns:
+            List[AudioFormat]: List of supported audio formats
+            
+        Example:
+            >>> client = TTSClient(api_key="your-api-key")
+            >>> formats = client.get_supported_audio_formats()
+            >>> print(f"Supported formats: {[f.value for f in formats]}")
+        """
+        if self._audio_player:
+            return self._audio_player.get_supported_formats()
+        return []
+    
+    def get_audio_player_stats(self) -> Dict[str, Any]:
+        """
+        Get audio player statistics and health information.
+        
+        Returns:
+            Dict[str, Any]: Audio player statistics
+            
+        Example:
+            >>> client = TTSClient(api_key="your-api-key")
+            >>> stats = client.get_audio_player_stats()
+            >>> print(f"Platform: {stats['platform']}")
+        """
+        if self._audio_player:
+            return self._audio_player.health_check()
+        return {"status": "no_audio_player", "audio_player_active": False}
+    
     def close(self):
         """
         Clean up resources and close the client.
@@ -2194,7 +2865,8 @@ class TTSClient:
             self.logger.info("Closing TTS client...")
             
             # Stop any ongoing playback
-            self.stop_playback()
+            if self._audio_player:
+                self._audio_player.stop_playback()
             
             # Clear caches
             self._voice_cache.clear()
@@ -2208,6 +2880,16 @@ class TTSClient:
                     self.logger.warning(f"Error closing session manager: {e}")
                 finally:
                     self._session_manager = None
+            
+            # Shutdown rate limiting manager if exists
+            if self._rate_limit_manager:
+                try:
+                    self._rate_limit_manager.shutdown_manager()
+                    self.logger.info("Rate limit manager shutdown")
+                except Exception as e:
+                    self.logger.warning(f"Error shutting down rate limit manager: {e}")
+                finally:
+                    self._rate_limit_manager = None
             
             # Mark as not initialized
             self._is_initialized = False

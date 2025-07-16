@@ -1332,6 +1332,559 @@ class FileOperationFilter(ToolFilter):
         return False
 
 
+class SearchFilter(ToolFilter):
+    """
+    Filter for search tools (Grep and LS) with result count summaries.
+    
+    This filter provides specialized behavior for search tools by:
+    - Filtering Grep and LS tools by default (returns False from should_speak)
+    - Providing option to enable with result summaries like "Found X matches in Y files" for Grep
+    - Generating "Directory contains X items" for LS
+    - Parsing search results to extract counts
+    - Handling empty results appropriately
+    """
+    
+    # Search tools this filter handles
+    SEARCH_TOOLS = {
+        'Grep', 'LS', 'Find', 'Locate', 'Which', 'Whereis'
+    }
+    
+    # Tools that should be excluded from TTS by default
+    DEFAULT_EXCLUDED_TOOLS = {
+        'Grep', 'LS'  # Search operations are typically silent
+    }
+    
+    def __init__(self):
+        """Initialize SearchFilter with default configuration."""
+        super().__init__()
+        self.speak_search_results = False    # Can be configured via settings
+        self.speak_empty_results = False     # Can be configured via settings
+        self.speak_errors = True             # Can be configured via settings
+        self.enable_result_summaries = True  # Can be configured via settings
+    
+    def should_speak(self, tool_name: str, response_data: Any) -> bool:
+        """
+        Determine if search tool output should trigger TTS.
+        
+        Logic:
+        - Always speak on errors (file not found, permission denied)
+        - For search results, speak only if enabled and has meaningful results
+        - By default, Grep and LS are excluded from TTS
+        - Consider result count and meaningfulness
+        
+        Args:
+            tool_name: Search tool name (Grep, LS, Find, etc.)
+            response_data: Search tool response data
+            
+        Returns:
+            bool: True if output should trigger TTS
+        """
+        if not self.speak_errors and not self.speak_search_results:
+            return False
+        
+        parsed = self._parse_response_data(response_data)
+        
+        # Check if this is an error response
+        if self._is_error_response(response_data):
+            return self.speak_errors
+        
+        # Check if tool is in default excluded list
+        if tool_name in self.DEFAULT_EXCLUDED_TOOLS and not self.speak_search_results:
+            return False
+        
+        # For search results, check if we should speak
+        if not self.speak_search_results:
+            return False
+        
+        # Check if there are meaningful search results
+        if self._has_meaningful_search_results(tool_name, parsed):
+            return True
+        
+        # Check if we should speak empty results
+        if self._has_empty_results(tool_name, parsed):
+            return self.speak_empty_results
+        
+        return False
+    
+    def get_custom_message(self, tool_name: str, response_data: Any) -> Optional[str]:
+        """
+        Generate custom TTS message for search tool output.
+        
+        Creates search-specific messages:
+        - Grep: "Found X matches in Y files" or "No matches found"
+        - LS: "Directory contains X items" or "Directory is empty"
+        - Find: "Found X items matching criteria"
+        - Error cases: "Search failed: [error message]"
+        
+        Args:
+            tool_name: Search tool name
+            response_data: Search tool response data
+            
+        Returns:
+            Optional[str]: Custom message for TTS, or None for default processing
+        """
+        parsed = self._parse_response_data(response_data)
+        
+        # Handle error cases
+        if self._is_error_response(response_data):
+            return self._generate_search_error_message(tool_name, parsed)
+        
+        # Handle search results
+        if self.enable_result_summaries:
+            return self._generate_search_result_message(tool_name, parsed)
+        
+        # Fallback to None for default processing
+        return None
+    
+    def _has_meaningful_search_results(self, tool_name: str, parsed_data: Dict[str, Any]) -> bool:
+        """
+        Check if search results contain meaningful information worth speaking.
+        
+        Args:
+            tool_name: Search tool name
+            parsed_data: Normalized response data
+            
+        Returns:
+            bool: True if results are meaningful
+        """
+        # Extract result count
+        result_count = self._extract_result_count(tool_name, parsed_data)
+        
+        # If we have a count, check if it's meaningful
+        if result_count is not None:
+            return result_count > 0
+        
+        # Check for text content that indicates results
+        text_content = self._extract_text_content(parsed_data)
+        if not text_content:
+            return False
+        
+        # Tool-specific result detection
+        if tool_name == 'Grep':
+            return self._has_grep_results(text_content)
+        elif tool_name == 'LS':
+            return self._has_ls_results(text_content)
+        elif tool_name in {'Find', 'Locate'}:
+            return self._has_find_results(text_content)
+        
+        # Default: if there's content, it's meaningful
+        return len(text_content.strip()) > 0
+    
+    def _has_empty_results(self, tool_name: str, parsed_data: Dict[str, Any]) -> bool:
+        """
+        Check if search results are empty.
+        
+        Args:
+            tool_name: Search tool name
+            parsed_data: Normalized response data
+            
+        Returns:
+            bool: True if results are empty
+        """
+        # Extract result count
+        result_count = self._extract_result_count(tool_name, parsed_data)
+        
+        # If we have a count, check if it's zero
+        if result_count is not None:
+            return result_count == 0
+        
+        # Check for empty text content
+        text_content = self._extract_text_content(parsed_data)
+        if not text_content or not text_content.strip():
+            return True
+        
+        # Tool-specific empty result detection
+        if tool_name == 'Grep':
+            return not self._has_grep_results(text_content)
+        elif tool_name == 'LS':
+            return not self._has_ls_results(text_content)
+        elif tool_name in {'Find', 'Locate'}:
+            return not self._has_find_results(text_content)
+        
+        return False
+    
+    def _has_grep_results(self, text_content: str) -> bool:
+        """Check if grep output contains actual matches."""
+        if not text_content.strip():
+            return False
+        
+        # Grep with no matches typically returns empty output
+        # Grep with matches returns the matching lines
+        lines = text_content.strip().split('\n')
+        
+        # Filter out empty lines and grep status messages
+        result_lines = []
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith('grep:') and not line.startswith('Binary file'):
+                result_lines.append(line)
+        
+        return len(result_lines) > 0
+    
+    def _has_ls_results(self, text_content: str) -> bool:
+        """Check if ls output contains directory entries."""
+        if not text_content.strip():
+            return False
+        
+        # LS with no entries typically returns empty output
+        # LS with entries returns file/directory listings
+        lines = text_content.strip().split('\n')
+        
+        # Filter out empty lines and ls status messages
+        result_lines = []
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith('ls:') and not line.startswith('total'):
+                result_lines.append(line)
+        
+        return len(result_lines) > 0
+    
+    def _has_find_results(self, text_content: str) -> bool:
+        """Check if find/locate output contains search results."""
+        if not text_content.strip():
+            return False
+        
+        # Find with no matches typically returns empty output
+        # Find with matches returns the matching paths
+        lines = text_content.strip().split('\n')
+        
+        # Filter out empty lines and find status messages
+        result_lines = []
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith('find:') and not line.startswith('locate:'):
+                result_lines.append(line)
+        
+        return len(result_lines) > 0
+    
+    def _extract_result_count(self, tool_name: str, parsed_data: Dict[str, Any]) -> Optional[int]:
+        """
+        Extract result count from search tool response data.
+        
+        Args:
+            tool_name: Search tool name
+            parsed_data: Normalized response data
+            
+        Returns:
+            Optional[int]: Number of results if found, None otherwise
+        """
+        # Check for explicit count fields
+        count_fields = ["count", "result_count", "matches", "items", "files", "total"]
+        
+        for field in count_fields:
+            if field in parsed_data and isinstance(parsed_data[field], int):
+                return parsed_data[field]
+        
+        # Try to extract count from text content
+        text_content = self._extract_text_content(parsed_data)
+        if text_content is not None:  # Allow empty strings
+            # Count lines for basic result counting
+            lines = text_content.strip().split('\n') if text_content.strip() else []
+            
+            # Tool-specific counting
+            if tool_name == 'Grep':
+                return self._count_grep_results(lines)
+            elif tool_name == 'LS':
+                return self._count_ls_results(lines)
+            elif tool_name in {'Find', 'Locate'}:
+                return self._count_find_results(lines)
+        
+        return None
+    
+    def _count_grep_results(self, lines: list) -> int:
+        """Count actual grep result lines."""
+        count = 0
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith('grep:') and not line.startswith('Binary file'):
+                count += 1
+        return count
+    
+    def _count_ls_results(self, lines: list) -> int:
+        """Count actual ls result lines."""
+        count = 0
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith('ls:') and not line.startswith('total'):
+                count += 1
+        return count
+    
+    def _count_find_results(self, lines: list) -> int:
+        """Count actual find/locate result lines."""
+        count = 0
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith('find:') and not line.startswith('locate:'):
+                count += 1
+        return count
+    
+    def _generate_search_error_message(self, tool_name: str, parsed_data: Dict[str, Any]) -> str:
+        """
+        Generate appropriate error message for search tool failures.
+        
+        Args:
+            tool_name: Search tool name
+            parsed_data: Normalized response data
+            
+        Returns:
+            str: Error message for TTS
+        """
+        # Extract error information
+        error_text = self._extract_error_output(parsed_data)
+        
+        # Generate context-aware error messages
+        if error_text:
+            error_lower = error_text.lower()
+            
+            # Common search tool errors
+            if "no such file or directory" in error_lower:
+                return f"{tool_name} failed: Path not found"
+            elif "permission denied" in error_lower:
+                return f"{tool_name} failed: Permission denied"
+            elif "not found" in error_lower:
+                return f"{tool_name} failed: Not found"
+            elif "invalid" in error_lower:
+                return f"{tool_name} failed: Invalid search criteria"
+            elif "too many arguments" in error_lower:
+                return f"{tool_name} failed: Too many arguments"
+            elif len(error_text) < 50:  # Keep it concise
+                return f"{tool_name} failed: {error_text}"
+        
+        # Default error messages by tool type
+        error_messages = {
+            'Grep': "Search failed",
+            'LS': "Directory listing failed",
+            'Find': "Find operation failed",
+            'Locate': "Locate operation failed",
+            'Which': "Which command failed",
+            'Whereis': "Whereis command failed",
+        }
+        
+        return error_messages.get(tool_name, f"{tool_name} operation failed")
+    
+    def _generate_search_result_message(self, tool_name: str, parsed_data: Dict[str, Any]) -> Optional[str]:
+        """
+        Generate appropriate result message for search operations.
+        
+        Args:
+            tool_name: Search tool name
+            parsed_data: Normalized response data
+            
+        Returns:
+            Optional[str]: Result message for TTS, or None for default processing
+        """
+        # Extract result count
+        result_count = self._extract_result_count(tool_name, parsed_data)
+        
+        # Generate tool-specific messages
+        if tool_name == 'Grep':
+            return self._generate_grep_message(result_count, parsed_data)
+        elif tool_name == 'LS':
+            return self._generate_ls_message(result_count, parsed_data)
+        elif tool_name in {'Find', 'Locate'}:
+            return self._generate_find_message(tool_name, result_count, parsed_data)
+        elif tool_name in {'Which', 'Whereis'}:
+            return self._generate_which_message(tool_name, result_count, parsed_data)
+        
+        # Default message
+        if result_count is not None:
+            if result_count == 0:
+                return f"No results found"
+            elif result_count == 1:
+                return f"Found 1 result"
+            else:
+                return f"Found {result_count} results"
+        
+        return None
+    
+    def _generate_grep_message(self, result_count: Optional[int], parsed_data: Dict[str, Any]) -> str:
+        """Generate specific message for grep operations."""
+        if result_count is not None:
+            if result_count == 0:
+                return "No matches found"
+            elif result_count == 1:
+                return "Found 1 match"
+            else:
+                # Try to extract file count for more detailed message
+                file_count = self._extract_file_count(parsed_data)
+                if file_count is not None and file_count > 1:
+                    return f"Found {result_count} matches in {file_count} files"
+                else:
+                    return f"Found {result_count} matches"
+        
+        # Fallback based on content analysis
+        text_content = self._extract_text_content(parsed_data)
+        if text_content and self._has_grep_results(text_content):
+            return "Found matches"
+        else:
+            return "No matches found"
+    
+    def _generate_ls_message(self, result_count: Optional[int], parsed_data: Dict[str, Any]) -> str:
+        """Generate specific message for ls operations."""
+        if result_count is not None:
+            if result_count == 0:
+                return "Directory is empty"
+            elif result_count == 1:
+                return "Directory contains 1 item"
+            else:
+                return f"Directory contains {result_count} items"
+        
+        # Fallback based on content analysis
+        text_content = self._extract_text_content(parsed_data)
+        if text_content and self._has_ls_results(text_content):
+            return "Directory listing available"
+        else:
+            return "Directory is empty"
+    
+    def _generate_find_message(self, tool_name: str, result_count: Optional[int], parsed_data: Dict[str, Any]) -> str:
+        """Generate specific message for find/locate operations."""
+        if result_count is not None:
+            if result_count == 0:
+                return "No files found"
+            elif result_count == 1:
+                return "Found 1 file"
+            else:
+                return f"Found {result_count} files"
+        
+        # Fallback based on content analysis
+        text_content = self._extract_text_content(parsed_data)
+        if text_content and self._has_find_results(text_content):
+            return "Found matching files"
+        else:
+            return "No files found"
+    
+    def _generate_which_message(self, tool_name: str, result_count: Optional[int], parsed_data: Dict[str, Any]) -> str:
+        """Generate specific message for which/whereis operations."""
+        text_content = self._extract_text_content(parsed_data)
+        
+        if text_content and text_content.strip():
+            if tool_name == 'Which':
+                return "Command found"
+            else:  # Whereis
+                return "Location found"
+        else:
+            if tool_name == 'Which':
+                return "Command not found"
+            else:  # Whereis
+                return "Location not found"
+    
+    def _extract_file_count(self, parsed_data: Dict[str, Any]) -> Optional[int]:
+        """
+        Extract file count from search results (e.g., for grep matches across files).
+        
+        Args:
+            parsed_data: Normalized response data
+            
+        Returns:
+            Optional[int]: Number of files if found, None otherwise
+        """
+        # Check for explicit file count fields
+        file_fields = ["file_count", "files", "num_files"]
+        
+        for field in file_fields:
+            if field in parsed_data and isinstance(parsed_data[field], int):
+                return parsed_data[field]
+        
+        # Try to extract from text content
+        text_content = self._extract_text_content(parsed_data)
+        if text_content:
+            # For grep output, count unique filenames
+            lines = text_content.strip().split('\n')
+            filenames = set()
+            
+            for line in lines:
+                line = line.strip()
+                if line and ':' in line:
+                    # Extract filename from "filename:match" format
+                    filename = line.split(':', 1)[0]
+                    if filename and not filename.startswith('grep:'):
+                        filenames.add(filename)
+            
+            return len(filenames) if filenames else None
+        
+        return None
+    
+    def _extract_error_output(self, parsed_data: Dict[str, Any]) -> Optional[str]:
+        """
+        Extract error output from response data.
+        
+        Args:
+            parsed_data: Normalized response data
+            
+        Returns:
+            Optional[str]: Error output text, or None if not found
+        """
+        # Check various fields where error output might be stored
+        error_fields = ["error", "error_message", "stderr", "exception", "message"]
+        
+        for field in error_fields:
+            if field in parsed_data and isinstance(parsed_data[field], str):
+                error_text = parsed_data[field].strip()
+                if error_text:
+                    return error_text
+        
+        # Check if the main content indicates an error
+        text_content = self._extract_text_content(parsed_data)
+        if text_content:
+            # Look for common error indicators
+            error_indicators = [
+                "error:", "failed:", "exception:", "not found", "permission denied",
+                "no such file", "invalid", "cannot", "unable to"
+            ]
+            
+            text_lower = text_content.lower()
+            for indicator in error_indicators:
+                if indicator in text_lower:
+                    return text_content
+        
+        return None
+    
+    def _is_error_response(self, response_data: Any) -> bool:
+        """
+        Check if the response indicates an error condition.
+        
+        Enhanced for search operations to detect common search-related errors.
+        
+        Args:
+            response_data: Raw response data
+            
+        Returns:
+            bool: True if the response indicates an error
+        """
+        # Use base class error detection first
+        if super()._is_error_response(response_data):
+            return True
+        
+        # Search operation specific error detection
+        # Check both text content and error output
+        text_sources = [
+            self._extract_text_content(response_data),
+            self._extract_error_output(self._parse_response_data(response_data))
+        ]
+        
+        for text_content in text_sources:
+            if text_content:
+                import re
+                error_patterns = [
+                    r"no such file or directory",
+                    r"permission denied",
+                    r"not found",
+                    r"invalid (option|argument|pattern)",
+                    r"too many arguments",
+                    r"cannot (access|read|open)",
+                    r"failed to",
+                    r"error:",
+                    r"usage:",  # Usage messages indicate incorrect usage
+                ]
+                
+                text_lower = text_content.lower()
+                for pattern in error_patterns:
+                    if re.search(pattern, text_lower):
+                        return True
+        
+        return False
+
+
 class DefaultToolFilter(ToolFilter):
     """
     Default implementation of ToolFilter for tools without specific filters.
@@ -1760,3 +2313,231 @@ if __name__ == "__main__":
             assert expected_contains.lower() in message.lower(), f"Expected message to contain '{expected_contains}', got '{message}'"
     
     print("\nFileOperationFilter implementation testing complete!")
+    
+    # Test SearchFilter
+    print("\n" + "="*50)
+    print("Testing SearchFilter implementation...")
+    
+    # Test SearchFilter
+    search_filter = SearchFilter()
+    print(f"Search filter tool name: {search_filter.get_tool_name()}")
+    
+    # Test cases for SearchFilter
+    search_test_cases = [
+        # Grep operations - Results
+        {"output": "file1.txt:match1\nfile2.txt:match2\nfile1.txt:match3", "tool": "Grep"},
+        {"content": "main.py:def function\nutils.py:def helper", "tool": "Grep"},
+        {"result": "config.json:key=value", "tool": "Grep"},
+        
+        # Grep operations - No results
+        {"output": "", "tool": "Grep"},
+        {"content": "grep: pattern not found", "tool": "Grep"},
+        
+        # LS operations - Results
+        {"output": "file1.txt\nfile2.py\ndirectory/", "tool": "LS"},
+        {"content": "total 64\n-rw-r--r-- 1 user staff 1234 file.txt\ndrwxr-xr-x 2 user staff 68 dir/", "tool": "LS"},
+        {"result": "README.md\nsrc/\ntests/", "tool": "LS"},
+        
+        # LS operations - Empty directory
+        {"output": "", "tool": "LS"},
+        {"content": "total 0", "tool": "LS"},
+        
+        # Find operations - Results
+        {"output": "/path/to/file1.txt\n/path/to/file2.py", "tool": "Find"},
+        {"content": "./src/main.py\n./tests/test.py", "tool": "Find"},
+        
+        # Find operations - No results
+        {"output": "", "tool": "Find"},
+        {"content": "find: no matches found", "tool": "Find"},
+        
+        # Which operations
+        {"output": "/usr/bin/python", "tool": "Which"},
+        {"output": "", "tool": "Which"},
+        
+        # Error cases
+        {"error": "Permission denied", "tool": "Grep"},
+        {"stderr": "No such file or directory", "tool": "LS"},
+        {"error": "Invalid search pattern", "tool": "Find"},
+        
+        # Edge cases
+        None,
+        "simple string response",
+        {"status": "success"},
+        {"output": "Binary file matches", "tool": "Grep"},
+    ]
+    
+    print("\nTesting SearchFilter with various scenarios:")
+    
+    # Test with different search tools
+    search_tools = ["Grep", "LS", "Find", "Locate", "Which", "Whereis"]
+    
+    for tool_name in search_tools:
+        print(f"\n--- Testing {tool_name} tool ---")
+        
+        # Test a subset of cases for each tool
+        relevant_cases = [case for case in search_test_cases[:8] if case and case.get("tool") == tool_name]
+        if not relevant_cases:
+            relevant_cases = search_test_cases[:3]  # Use first 3 generic cases
+        
+        for i, test_case in enumerate(relevant_cases, 1):
+            should_speak = search_filter.should_speak(tool_name, test_case)
+            custom_message = search_filter.get_custom_message(tool_name, test_case)
+            
+            print(f"{i}. {tool_name} Input: {test_case}")
+            print(f"   Should speak: {should_speak}")
+            print(f"   Custom message: {custom_message}")
+            print()
+    
+    # Test result count extraction
+    print("\nTesting search result count extraction:")
+    count_test_cases = [
+        {"tool": "Grep", "output": "file1.txt:match1\nfile2.txt:match2\nfile1.txt:match3", "expected": 3},
+        {"tool": "LS", "output": "file1.txt\nfile2.py\ndirectory/", "expected": 3},
+        {"tool": "Find", "output": "/path/file1\n/path/file2", "expected": 2},
+        {"tool": "Grep", "output": "", "expected": 0},
+        {"tool": "LS", "output": "total 0", "expected": 0},
+        {"tool": "Find", "output": "", "expected": 0},
+        {"tool": "Grep", "count": 5, "expected": 5},
+        {"tool": "LS", "items": 10, "expected": 10},
+        {"tool": "Find", "result_count": 7, "expected": 7},
+    ]
+    
+    for i, test_case in enumerate(count_test_cases, 1):
+        tool_name = test_case["tool"]
+        parsed_data = search_filter._parse_response_data(test_case)
+        extracted = search_filter._extract_result_count(tool_name, parsed_data)
+        expected = test_case["expected"]
+        
+        print(f"{i}. {tool_name} Input: {test_case} -> Extracted: {extracted} (Expected: {expected})")
+        assert extracted == expected, f"Expected {expected}, got {extracted}"
+    
+    # Test meaningful results detection
+    print("\nTesting meaningful search results detection:")
+    meaningful_test_cases = [
+        {"tool": "Grep", "output": "file.txt:match", "expected": True},
+        {"tool": "Grep", "output": "", "expected": False},
+        {"tool": "Grep", "output": "grep: pattern not found", "expected": False},
+        {"tool": "LS", "output": "file1.txt\nfile2.py", "expected": True},
+        {"tool": "LS", "output": "", "expected": False},
+        {"tool": "LS", "output": "total 0", "expected": False},
+        {"tool": "Find", "output": "/path/file.txt", "expected": True},
+        {"tool": "Find", "output": "", "expected": False},
+        {"tool": "Which", "output": "/usr/bin/python", "expected": True},
+        {"tool": "Which", "output": "", "expected": False},
+    ]
+    
+    for i, test_case in enumerate(meaningful_test_cases, 1):
+        tool_name = test_case["tool"]
+        parsed_data = search_filter._parse_response_data(test_case)
+        is_meaningful = search_filter._has_meaningful_search_results(tool_name, parsed_data)
+        expected = test_case["expected"]
+        
+        print(f"{i}. {tool_name} '{test_case.get('output', '')[:30]}...' -> Meaningful: {is_meaningful} (Expected: {expected})")
+        assert is_meaningful == expected, f"Expected {expected}, got {is_meaningful}"
+    
+    # Test empty results detection
+    print("\nTesting empty search results detection:")
+    empty_test_cases = [
+        {"tool": "Grep", "output": "file.txt:match", "expected": False},
+        {"tool": "Grep", "output": "", "expected": True},
+        {"tool": "LS", "output": "file1.txt", "expected": False},
+        {"tool": "LS", "output": "", "expected": True},
+        {"tool": "Find", "output": "/path/file.txt", "expected": False},
+        {"tool": "Find", "output": "", "expected": True},
+        {"tool": "Which", "output": "/usr/bin/python", "expected": False},
+        {"tool": "Which", "output": "", "expected": True},
+    ]
+    
+    for i, test_case in enumerate(empty_test_cases, 1):
+        tool_name = test_case["tool"]
+        parsed_data = search_filter._parse_response_data(test_case)
+        is_empty = search_filter._has_empty_results(tool_name, parsed_data)
+        expected = test_case["expected"]
+        
+        print(f"{i}. {tool_name} '{test_case.get('output', '')[:30]}...' -> Empty: {is_empty} (Expected: {expected})")
+        assert is_empty == expected, f"Expected {expected}, got {is_empty}"
+    
+    # Test error detection
+    print("\nTesting search operation error detection:")
+    search_error_test_cases = [
+        {"tool": "Grep", "error": "Permission denied", "expected": True},
+        {"tool": "LS", "stderr": "No such file or directory", "expected": True},
+        {"tool": "Find", "content": "find: invalid option", "expected": True},
+        {"tool": "Grep", "output": "file.txt:match", "expected": False},
+        {"tool": "LS", "output": "file1.txt", "expected": False},
+        {"tool": "Find", "output": "/path/file.txt", "expected": False},
+        {"tool": "Which", "content": "usage: which command", "expected": True},
+    ]
+    
+    for i, test_case in enumerate(search_error_test_cases, 1):
+        tool_name = test_case["tool"]
+        is_error = search_filter._is_error_response(test_case)
+        expected = test_case["expected"]
+        
+        print(f"{i}. {tool_name} Input: {test_case} -> Is error: {is_error} (Expected: {expected})")
+        assert is_error == expected, f"Expected {expected}, got {is_error}"
+    
+    # Test specific message generation
+    print("\nTesting search-specific message generation:")
+    message_test_cases = [
+        {"tool": "Grep", "output": "file1.txt:match1\nfile2.txt:match2", "expected_contains": "Found 2 matches"},
+        {"tool": "Grep", "output": "", "expected_contains": "No matches found"},
+        {"tool": "LS", "output": "file1.txt\nfile2.py\ndir/", "expected_contains": "Directory contains 3 items"},
+        {"tool": "LS", "output": "", "expected_contains": "Directory is empty"},
+        {"tool": "Find", "output": "/path/file1\n/path/file2", "expected_contains": "Found 2 files"},
+        {"tool": "Find", "output": "", "expected_contains": "No files found"},
+        {"tool": "Which", "output": "/usr/bin/python", "expected_contains": "Command found"},
+        {"tool": "Which", "output": "", "expected_contains": "Command not found"},
+        {"tool": "Whereis", "output": "/usr/bin/python", "expected_contains": "Location found"},
+        {"tool": "Whereis", "output": "", "expected_contains": "Location not found"},
+    ]
+    
+    for i, test_case in enumerate(message_test_cases, 1):
+        tool_name = test_case["tool"]
+        parsed_data = search_filter._parse_response_data(test_case)
+        message = search_filter._generate_search_result_message(tool_name, parsed_data)
+        expected_contains = test_case["expected_contains"]
+        
+        print(f"{i}. {tool_name} -> Message: '{message}'")
+        assert expected_contains.lower() in message.lower(), f"Expected message to contain '{expected_contains}', got '{message}'"
+    
+    # Test file count extraction for grep
+    print("\nTesting file count extraction for grep:")
+    file_count_test_cases = [
+        {"output": "file1.txt:match1\nfile2.txt:match2\nfile1.txt:match3", "expected": 2},
+        {"output": "single.txt:match", "expected": 1},
+        {"output": "file1.txt:match1\nfile2.txt:match2\nfile3.txt:match3", "expected": 3},
+        {"output": "", "expected": None},
+        {"output": "match without colon", "expected": None},
+        {"files": 5, "expected": 5},
+    ]
+    
+    for i, test_case in enumerate(file_count_test_cases, 1):
+        parsed_data = search_filter._parse_response_data(test_case)
+        extracted = search_filter._extract_file_count(parsed_data)
+        expected = test_case["expected"]
+        
+        print(f"{i}. Input: {test_case} -> Extracted: {extracted} (Expected: {expected})")
+        if expected is not None:
+            assert extracted == expected, f"Expected {expected}, got {extracted}"
+    
+    # Test error message generation
+    print("\nTesting search error message generation:")
+    search_error_message_test_cases = [
+        {"tool": "Grep", "error": "Permission denied", "expected_contains": "Permission denied"},
+        {"tool": "LS", "error": "No such file or directory", "expected_contains": "Path not found"},
+        {"tool": "Find", "error": "Invalid search pattern", "expected_contains": "Invalid search criteria"},
+        {"tool": "Locate", "error": "Database not found", "expected_contains": "Locate failed"},
+        {"tool": "Which", "error": "Command not found", "expected_contains": "Not found"},
+    ]
+    
+    for i, test_case in enumerate(search_error_message_test_cases, 1):
+        tool_name = test_case["tool"]
+        parsed_data = search_filter._parse_response_data(test_case)
+        message = search_filter._generate_search_error_message(tool_name, parsed_data)
+        expected_contains = test_case["expected_contains"]
+        
+        print(f"{i}. {tool_name} -> Error message: '{message}'")
+        assert expected_contains.lower() in message.lower(), f"Expected message to contain '{expected_contains}', got '{message}'"
+    
+    print("\nSearchFilter implementation testing complete!")

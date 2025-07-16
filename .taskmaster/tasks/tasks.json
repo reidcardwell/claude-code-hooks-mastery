@@ -101,7 +101,7 @@
         "dependencies": [
           2
         ],
-        "status": "pending",
+        "status": "done",
         "subtasks": [
           {
             "id": 1,
@@ -168,7 +168,7 @@
               5
             ],
             "details": "Implement DEFAULT_EXCLUDED_TOOLS = ['Read', 'Grep', 'LS', 'TodoRead']. Add configuration loading from settings to override defaults. Create ToolFilterRegistry to manage all filters and exclusions. Implement get_filter(tool_name) method to return appropriate filter instance. Add method to check if tool is excluded before applying filters.",
-            "status": "pending",
+            "status": "done",
             "testStrategy": ""
           },
           {
@@ -183,7 +183,7 @@
               5
             ],
             "details": "Implement MessageTemplate class with placeholders for tool output values. Create message templates for each filter type. Support variable extraction from tool responses (filenames, counts, status codes). Add message length optimization for TTS. Implement fallback to raw output if custom message generation fails.",
-            "status": "pending",
+            "status": "done",
             "testStrategy": ""
           }
         ]
@@ -1263,7 +1263,7 @@
     ],
     "metadata": {
       "created": "2025-07-15T19:44:16.184Z",
-      "updated": "2025-07-16T16:29:29.609Z",
+      "updated": "2025-07-16T16:44:13.510Z",
       "description": "Tasks for master context"
     }
   }

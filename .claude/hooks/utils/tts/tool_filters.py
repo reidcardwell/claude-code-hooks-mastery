@@ -27,7 +27,7 @@ Usage:
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Dict, Union
+from typing import Any, Dict, List, Optional, Union
 import json
 import re
 
@@ -1917,6 +1917,803 @@ class DefaultToolFilter(ToolFilter):
         return None
 
 
+class ToolFilterRegistry:
+    """
+    Registry for managing tool filters and default exclusion lists.
+    
+    This class provides a centralized system for:
+    - Managing default exclusion lists for tools that shouldn't trigger TTS
+    - Loading configuration from settings to override defaults
+    - Providing access to appropriate filter instances for each tool
+    - Checking if tools are excluded before applying filters
+    """
+    
+    # Default tools that should be excluded from TTS
+    DEFAULT_EXCLUDED_TOOLS = {
+        'Read', 'Grep', 'LS', 'TodoRead', 'NotebookRead'
+    }
+    
+    # Additional tools that might be excluded based on configuration
+    CONFIGURABLE_EXCLUDED_TOOLS = {
+        'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
+        'Find', 'Locate', 'Which', 'Whereis'
+    }
+    
+    def __init__(self, settings_path: Optional[str] = None):
+        """
+        Initialize the ToolFilterRegistry.
+        
+        Args:
+            settings_path: Optional path to settings file for configuration
+        """
+        self.settings_path = settings_path
+        self.excluded_tools = self.DEFAULT_EXCLUDED_TOOLS.copy()
+        self.filter_instances = {}
+        self.configuration = {}
+        
+        # Load configuration from settings if provided
+        if settings_path:
+            self.load_configuration()
+        
+        # Initialize filter instances
+        self._initialize_filters()
+    
+    def _initialize_filters(self):
+        """Initialize all available filter instances."""
+        self.filter_instances = {
+            'Bash': BashFilter(),
+            'Git': GitFilter(),
+            'FileOperation': FileOperationFilter(),
+            'Search': SearchFilter(),
+            'Default': DefaultToolFilter()
+        }
+        
+        # Apply configuration to filters
+        self._apply_configuration()
+    
+    def load_configuration(self):
+        """
+        Load configuration from settings file.
+        
+        Expected configuration format:
+        {
+            "tts_settings": {
+                "excluded_tools": ["Read", "Grep", "LS", "TodoRead"],
+                "filter_settings": {
+                    "bash": {"speak_success": true, "speak_errors": true},
+                    "git": {"speak_success": true, "speak_errors": true},
+                    "file_operation": {"speak_write_operations": true, "speak_read_operations": false},
+                    "search": {"speak_search_results": false, "speak_errors": true}
+                }
+            }
+        }
+        """
+        if not self.settings_path:
+            return
+        
+        try:
+            import json
+            import os
+            
+            if os.path.exists(self.settings_path):
+                with open(self.settings_path, 'r') as f:
+                    settings = json.load(f)
+                
+                # Extract TTS configuration
+                tts_settings = settings.get('tts_settings', {})
+                self.configuration = tts_settings
+                
+                # Update excluded tools if configured
+                if 'excluded_tools' in tts_settings:
+                    self.excluded_tools = set(tts_settings['excluded_tools'])
+                
+        except Exception as e:
+            # If configuration loading fails, use defaults
+            print(f"Warning: Failed to load TTS configuration: {e}")
+            self.configuration = {}
+    
+    def _apply_configuration(self):
+        """Apply loaded configuration to filter instances."""
+        filter_settings = self.configuration.get('filter_settings', {})
+        
+        # Apply Bash filter configuration
+        if 'bash' in filter_settings:
+            bash_config = filter_settings['bash']
+            bash_filter = self.filter_instances['Bash']
+            if 'speak_success' in bash_config:
+                bash_filter.speak_success = bash_config['speak_success']
+            if 'speak_errors' in bash_config:
+                bash_filter.speak_errors = bash_config['speak_errors']
+        
+        # Apply Git filter configuration
+        if 'git' in filter_settings:
+            git_config = filter_settings['git']
+            git_filter = self.filter_instances['Git']
+            if 'speak_success' in git_config:
+                git_filter.speak_success = git_config['speak_success']
+            if 'speak_errors' in git_config:
+                git_filter.speak_errors = git_config['speak_errors']
+        
+        # Apply FileOperation filter configuration
+        if 'file_operation' in filter_settings:
+            file_config = filter_settings['file_operation']
+            file_filter = self.filter_instances['FileOperation']
+            if 'speak_write_operations' in file_config:
+                file_filter.speak_write_operations = file_config['speak_write_operations']
+            if 'speak_read_operations' in file_config:
+                file_filter.speak_read_operations = file_config['speak_read_operations']
+            if 'speak_errors' in file_config:
+                file_filter.speak_errors = file_config['speak_errors']
+        
+        # Apply Search filter configuration
+        if 'search' in filter_settings:
+            search_config = filter_settings['search']
+            search_filter = self.filter_instances['Search']
+            if 'speak_search_results' in search_config:
+                search_filter.speak_search_results = search_config['speak_search_results']
+            if 'speak_empty_results' in search_config:
+                search_filter.speak_empty_results = search_config['speak_empty_results']
+            if 'speak_errors' in search_config:
+                search_filter.speak_errors = search_config['speak_errors']
+            if 'enable_result_summaries' in search_config:
+                search_filter.enable_result_summaries = search_config['enable_result_summaries']
+    
+    def is_tool_excluded(self, tool_name: str) -> bool:
+        """
+        Check if a tool is in the exclusion list.
+        
+        Args:
+            tool_name: Name of the tool to check
+            
+        Returns:
+            bool: True if the tool should be excluded from TTS
+        """
+        return tool_name in self.excluded_tools
+    
+    def get_filter(self, tool_name: str) -> ToolFilter:
+        """
+        Get the appropriate filter instance for a tool.
+        
+        Args:
+            tool_name: Name of the tool to get filter for
+            
+        Returns:
+            ToolFilter: Appropriate filter instance
+        """
+        # Map tool names to filter types
+        tool_to_filter_map = {
+            # Bash tools
+            'Bash': 'Bash',
+            
+            # Git tools
+            'Git': 'Git',
+            
+            # File operation tools
+            'Read': 'FileOperation',
+            'Write': 'FileOperation', 
+            'Edit': 'FileOperation',
+            'MultiEdit': 'FileOperation',
+            'NotebookRead': 'FileOperation',
+            'NotebookEdit': 'FileOperation',
+            
+            # Search tools
+            'Grep': 'Search',
+            'LS': 'Search',
+            'Find': 'Search',
+            'Locate': 'Search',
+            'Which': 'Search',
+            'Whereis': 'Search',
+        }
+        
+        # Get the filter type for this tool
+        filter_type = tool_to_filter_map.get(tool_name, 'Default')
+        
+        # Return the appropriate filter instance
+        return self.filter_instances[filter_type]
+    
+    def should_speak(self, tool_name: str, response_data: Any) -> bool:
+        """
+        Determine if a tool's output should trigger TTS.
+        
+        This is the main entry point for TTS decision making. It:
+        1. Checks if the tool is excluded
+        2. Gets the appropriate filter
+        3. Applies the filter logic
+        
+        Args:
+            tool_name: Name of the tool that generated the response
+            response_data: Raw response data from the tool
+            
+        Returns:
+            bool: True if the response should trigger TTS
+        """
+        # Check if tool is excluded
+        if self.is_tool_excluded(tool_name):
+            return False
+        
+        # Get appropriate filter and apply it
+        filter_instance = self.get_filter(tool_name)
+        return filter_instance.should_speak(tool_name, response_data)
+    
+    def get_custom_message(self, tool_name: str, response_data: Any) -> Optional[str]:
+        """
+        Generate custom TTS message for tool output.
+        
+        Args:
+            tool_name: Name of the tool that generated the response
+            response_data: Raw response data from the tool
+            
+        Returns:
+            Optional[str]: Custom message for TTS, or None for default processing
+        """
+        # Get appropriate filter and generate message
+        filter_instance = self.get_filter(tool_name)
+        return filter_instance.get_custom_message(tool_name, response_data)
+    
+    def add_excluded_tool(self, tool_name: str):
+        """
+        Add a tool to the exclusion list.
+        
+        Args:
+            tool_name: Name of the tool to exclude
+        """
+        self.excluded_tools.add(tool_name)
+    
+    def remove_excluded_tool(self, tool_name: str):
+        """
+        Remove a tool from the exclusion list.
+        
+        Args:
+            tool_name: Name of the tool to include
+        """
+        self.excluded_tools.discard(tool_name)
+    
+    def get_excluded_tools(self) -> set:
+        """
+        Get the current set of excluded tools.
+        
+        Returns:
+            set: Set of excluded tool names
+        """
+        return self.excluded_tools.copy()
+    
+    def get_available_filters(self) -> dict:
+        """
+        Get information about available filters.
+        
+        Returns:
+            dict: Dictionary mapping filter names to their instances
+        """
+        return self.filter_instances.copy()
+    
+    def reload_configuration(self):
+        """
+        Reload configuration from settings file.
+        
+        This method can be called to update the registry with new settings
+        without reinitializing the entire system.
+        """
+        # Reset to defaults
+        self.excluded_tools = self.DEFAULT_EXCLUDED_TOOLS.copy()
+        self.configuration = {}
+        
+        # Reload configuration
+        if self.settings_path:
+            self.load_configuration()
+        
+        # Reapply configuration to filters
+        self._apply_configuration()
+    
+    def get_configuration_info(self) -> dict:
+        """
+        Get information about current configuration.
+        
+        Returns:
+            dict: Configuration information including excluded tools and filter settings
+        """
+        return {
+            'excluded_tools': list(self.excluded_tools),
+            'default_excluded_tools': list(self.DEFAULT_EXCLUDED_TOOLS),
+            'configuration': self.configuration,
+            'available_filters': list(self.filter_instances.keys())
+        }
+
+
+# Global registry instance for easy access
+_global_registry = None
+
+def get_global_registry() -> ToolFilterRegistry:
+    """
+    Get the global ToolFilterRegistry instance.
+    
+    This provides a singleton pattern for accessing the registry throughout
+    the application. The registry is initialized with default settings on
+    first access.
+    
+    Returns:
+        ToolFilterRegistry: The global registry instance
+    """
+    global _global_registry
+    if _global_registry is None:
+        _global_registry = ToolFilterRegistry()
+    return _global_registry
+
+def initialize_global_registry(settings_path: Optional[str] = None):
+    """
+    Initialize the global registry with custom settings.
+    
+    Args:
+        settings_path: Path to settings file for configuration
+    """
+    global _global_registry
+    _global_registry = ToolFilterRegistry(settings_path)
+
+
+class MessageTemplate:
+    """
+    Flexible message templating system for tool-specific outputs.
+    
+    This class provides a templating system that allows dynamic message generation
+    based on tool output values. It supports variable extraction, template
+    substitution, and fallback mechanisms for robust message generation.
+    """
+    
+    def __init__(self, template: str, variables: Optional[Dict[str, str]] = None):
+        """
+        Initialize a MessageTemplate.
+        
+        Args:
+            template: Template string with placeholders (e.g., "File {filename} updated successfully")
+            variables: Optional dictionary of variable names to extraction patterns
+        """
+        self.template = template
+        self.variables = variables or {}
+        self.max_length = 100  # Maximum message length for TTS optimization
+    
+    def generate_message(self, response_data: Dict[str, Any]) -> Optional[str]:
+        """
+        Generate a message from the template using response data.
+        
+        Args:
+            response_data: Parsed response data from tool execution
+            
+        Returns:
+            Optional[str]: Generated message, or None if generation fails
+        """
+        try:
+            # Extract variables from response data
+            extracted_vars = {}
+            for var_name, pattern in self.variables.items():
+                extracted_value = self._extract_variable(response_data, var_name, pattern)
+                if extracted_value is not None:
+                    extracted_vars[var_name] = extracted_value
+            
+            # Generate message from template
+            message = self.template.format(**extracted_vars)
+            
+            # Optimize message length for TTS
+            optimized_message = self._optimize_message_length(message)
+            
+            return optimized_message
+            
+        except Exception as e:
+            # Return None if message generation fails
+            return None
+    
+    def _extract_variable(self, response_data: Dict[str, Any], var_name: str, pattern: str) -> Optional[str]:
+        """
+        Extract a variable value from response data using a pattern.
+        
+        Args:
+            response_data: Parsed response data
+            var_name: Name of the variable to extract
+            pattern: Extraction pattern (field name, regex, or special pattern)
+            
+        Returns:
+            Optional[str]: Extracted value, or None if not found
+        """
+        # Handle special patterns
+        if pattern == "filename":
+            return self._extract_filename_from_data(response_data)
+        elif pattern == "count":
+            return self._extract_count_from_data(response_data)
+        elif pattern == "status":
+            return self._extract_status_from_data(response_data)
+        elif pattern == "command":
+            return self._extract_command_from_data(response_data)
+        elif pattern == "exit_code":
+            return self._extract_exit_code_from_data(response_data)
+        
+        # Handle direct field access
+        if pattern in response_data:
+            value = response_data[pattern]
+            if isinstance(value, str):
+                return value
+            elif isinstance(value, (int, float)):
+                return str(value)
+        
+        # Handle regex patterns
+        if pattern.startswith("regex:"):
+            regex_pattern = pattern[6:]  # Remove "regex:" prefix
+            text_content = self._get_text_content(response_data)
+            if text_content:
+                import re
+                match = re.search(regex_pattern, text_content)
+                if match:
+                    return match.group(1) if match.groups() else match.group(0)
+        
+        return None
+    
+    def _extract_filename_from_data(self, response_data: Dict[str, Any]) -> Optional[str]:
+        """Extract filename from response data."""
+        # Check common filename fields
+        filename_fields = ["file_path", "filepath", "filename", "path", "notebook_path"]
+        
+        for field in filename_fields:
+            if field in response_data and isinstance(response_data[field], str):
+                filepath = response_data[field]
+                if filepath:
+                    import os
+                    return os.path.basename(filepath)
+        
+        return None
+    
+    def _extract_count_from_data(self, response_data: Dict[str, Any]) -> Optional[str]:
+        """Extract count from response data."""
+        # Check common count fields
+        count_fields = ["count", "result_count", "edit_count", "file_count", "items"]
+        
+        for field in count_fields:
+            if field in response_data and isinstance(response_data[field], (int, float)):
+                return str(response_data[field])
+        
+        return None
+    
+    def _extract_status_from_data(self, response_data: Dict[str, Any]) -> Optional[str]:
+        """Extract status from response data."""
+        # Check common status fields
+        status_fields = ["status", "result", "outcome"]
+        
+        for field in status_fields:
+            if field in response_data and isinstance(response_data[field], str):
+                return response_data[field]
+        
+        return None
+    
+    def _extract_command_from_data(self, response_data: Dict[str, Any]) -> Optional[str]:
+        """Extract command from response data."""
+        if "command" in response_data and isinstance(response_data["command"], str):
+            return response_data["command"]
+        return None
+    
+    def _extract_exit_code_from_data(self, response_data: Dict[str, Any]) -> Optional[str]:
+        """Extract exit code from response data."""
+        if "exit_code" in response_data and isinstance(response_data["exit_code"], (int, float)):
+            return str(response_data["exit_code"])
+        return None
+    
+    def _get_text_content(self, response_data: Dict[str, Any]) -> Optional[str]:
+        """Get text content from response data for regex matching."""
+        text_fields = ["output", "content", "text", "result", "message"]
+        
+        for field in text_fields:
+            if field in response_data and isinstance(response_data[field], str):
+                return response_data[field]
+        
+        return None
+    
+    def _optimize_message_length(self, message: str) -> str:
+        """
+        Optimize message length for TTS by truncating if necessary.
+        
+        Args:
+            message: Original message
+            
+        Returns:
+            str: Optimized message suitable for TTS
+        """
+        if len(message) <= self.max_length:
+            return message
+        
+        # Truncate while preserving word boundaries
+        words = message.split()
+        truncated_words = []
+        current_length = 0
+        
+        for word in words:
+            if current_length + len(word) + 1 <= self.max_length - 3:  # Reserve space for "..."
+                truncated_words.append(word)
+                current_length += len(word) + 1
+            else:
+                break
+        
+        return " ".join(truncated_words) + "..."
+    
+    def set_max_length(self, max_length: int):
+        """Set maximum message length for TTS optimization."""
+        self.max_length = max_length
+    
+    def add_variable(self, name: str, pattern: str):
+        """Add a variable extraction pattern."""
+        self.variables[name] = pattern
+    
+    def remove_variable(self, name: str):
+        """Remove a variable extraction pattern."""
+        self.variables.pop(name, None)
+
+
+class MessageTemplateRegistry:
+    """
+    Registry for managing message templates for different tool types.
+    
+    This class provides centralized management of message templates,
+    allowing tools to generate consistent, optimized messages for TTS.
+    """
+    
+    def __init__(self):
+        """Initialize the MessageTemplateRegistry with default templates."""
+        self.templates = {}
+        self._initialize_default_templates()
+    
+    def _initialize_default_templates(self):
+        """Initialize default message templates for common tool operations."""
+        
+        # Bash command templates
+        self.templates["bash_success"] = MessageTemplate(
+            "Command completed successfully",
+            {}
+        )
+        
+        self.templates["bash_error"] = MessageTemplate(
+            "Command failed with exit code {exit_code}",
+            {"exit_code": "exit_code"}
+        )
+        
+        self.templates["bash_mkdir"] = MessageTemplate(
+            "Directory created",
+            {}
+        )
+        
+        self.templates["bash_rm"] = MessageTemplate(
+            "File removed",
+            {}
+        )
+        
+        self.templates["bash_cp"] = MessageTemplate(
+            "File copied",
+            {}
+        )
+        
+        # Git operation templates
+        self.templates["git_commit"] = MessageTemplate(
+            "Changes committed successfully",
+            {}
+        )
+        
+        self.templates["git_push"] = MessageTemplate(
+            "Pushed to remote",
+            {}
+        )
+        
+        self.templates["git_pull"] = MessageTemplate(
+            "Repository updated",
+            {}
+        )
+        
+        self.templates["git_checkout"] = MessageTemplate(
+            "Switched to branch",
+            {}
+        )
+        
+        self.templates["git_merge"] = MessageTemplate(
+            "Merge completed",
+            {}
+        )
+        
+        self.templates["git_error"] = MessageTemplate(
+            "Git operation failed",
+            {}
+        )
+        
+        # File operation templates
+        self.templates["file_created"] = MessageTemplate(
+            "File created: {filename}",
+            {"filename": "filename"}
+        )
+        
+        self.templates["file_updated"] = MessageTemplate(
+            "File updated: {filename}",
+            {"filename": "filename"}
+        )
+        
+        self.templates["file_read"] = MessageTemplate(
+            "File read: {filename}",
+            {"filename": "filename"}
+        )
+        
+        self.templates["file_error"] = MessageTemplate(
+            "File operation failed: {filename}",
+            {"filename": "filename"}
+        )
+        
+        self.templates["multi_edit"] = MessageTemplate(
+            "Applied {count} edits to {filename}",
+            {"count": "count", "filename": "filename"}
+        )
+        
+        # Search operation templates
+        self.templates["grep_results"] = MessageTemplate(
+            "Found {count} matches",
+            {"count": "count"}
+        )
+        
+        self.templates["grep_no_results"] = MessageTemplate(
+            "No matches found",
+            {}
+        )
+        
+        self.templates["ls_results"] = MessageTemplate(
+            "Directory contains {count} items",
+            {"count": "count"}
+        )
+        
+        self.templates["ls_empty"] = MessageTemplate(
+            "Directory is empty",
+            {}
+        )
+        
+        self.templates["find_results"] = MessageTemplate(
+            "Found {count} files",
+            {"count": "count"}
+        )
+        
+        self.templates["find_no_results"] = MessageTemplate(
+            "No files found",
+            {}
+        )
+        
+        self.templates["command_found"] = MessageTemplate(
+            "Command found",
+            {}
+        )
+        
+        self.templates["command_not_found"] = MessageTemplate(
+            "Command not found",
+            {}
+        )
+        
+        # Error templates
+        self.templates["permission_denied"] = MessageTemplate(
+            "Permission denied",
+            {}
+        )
+        
+        self.templates["file_not_found"] = MessageTemplate(
+            "File not found: {filename}",
+            {"filename": "filename"}
+        )
+        
+        self.templates["generic_error"] = MessageTemplate(
+            "Operation failed",
+            {}
+        )
+        
+        self.templates["generic_success"] = MessageTemplate(
+            "Operation completed successfully",
+            {}
+        )
+    
+    def get_template(self, template_name: str) -> Optional[MessageTemplate]:
+        """
+        Get a message template by name.
+        
+        Args:
+            template_name: Name of the template to retrieve
+            
+        Returns:
+            Optional[MessageTemplate]: The template if found, None otherwise
+        """
+        return self.templates.get(template_name)
+    
+    def add_template(self, name: str, template: MessageTemplate):
+        """
+        Add a new message template.
+        
+        Args:
+            name: Name of the template
+            template: MessageTemplate instance
+        """
+        self.templates[name] = template
+    
+    def remove_template(self, name: str):
+        """
+        Remove a message template.
+        
+        Args:
+            name: Name of the template to remove
+        """
+        self.templates.pop(name, None)
+    
+    def generate_message(self, template_name: str, response_data: Dict[str, Any]) -> Optional[str]:
+        """
+        Generate a message using a template.
+        
+        Args:
+            template_name: Name of the template to use
+            response_data: Response data for variable extraction
+            
+        Returns:
+            Optional[str]: Generated message, or None if generation fails
+        """
+        template = self.get_template(template_name)
+        if template:
+            return template.generate_message(response_data)
+        return None
+    
+    def list_templates(self) -> List[str]:
+        """Get a list of all available template names."""
+        return list(self.templates.keys())
+    
+    def get_templates_for_tool(self, tool_name: str) -> List[str]:
+        """
+        Get template names relevant to a specific tool.
+        
+        Args:
+            tool_name: Name of the tool
+            
+        Returns:
+            List[str]: List of relevant template names
+        """
+        tool_prefixes = {
+            "Bash": ["bash_", "generic_"],
+            "Git": ["git_", "generic_"],
+            "Read": ["file_", "generic_"],
+            "Write": ["file_", "generic_"],
+            "Edit": ["file_", "multi_edit", "generic_"],
+            "MultiEdit": ["multi_edit", "file_", "generic_"],
+            "NotebookRead": ["file_", "generic_"],
+            "NotebookEdit": ["file_", "generic_"],
+            "Grep": ["grep_", "generic_"],
+            "LS": ["ls_", "generic_"],
+            "Find": ["find_", "generic_"],
+            "Locate": ["find_", "generic_"],
+            "Which": ["command_", "generic_"],
+            "Whereis": ["command_", "generic_"],
+        }
+        
+        prefixes = tool_prefixes.get(tool_name, ["generic_"])
+        relevant_templates = []
+        
+        for template_name in self.templates.keys():
+            for prefix in prefixes:
+                if template_name.startswith(prefix):
+                    relevant_templates.append(template_name)
+                    break
+        
+        return relevant_templates
+
+
+# Global message template registry
+_global_template_registry = None
+
+def get_global_template_registry() -> MessageTemplateRegistry:
+    """
+    Get the global MessageTemplateRegistry instance.
+    
+    Returns:
+        MessageTemplateRegistry: The global template registry instance
+    """
+    global _global_template_registry
+    if _global_template_registry is None:
+        _global_template_registry = MessageTemplateRegistry()
+    return _global_template_registry
+
+def initialize_global_template_registry():
+    """Initialize the global template registry."""
+    global _global_template_registry
+    _global_template_registry = MessageTemplateRegistry()
+
+
 if __name__ == "__main__":
     # Test both base class and BashFilter implementation
     print("Testing ToolFilter base class and BashFilter...")
@@ -2541,3 +3338,549 @@ if __name__ == "__main__":
         assert expected_contains.lower() in message.lower(), f"Expected message to contain '{expected_contains}', got '{message}'"
     
     print("\nSearchFilter implementation testing complete!")
+    
+    # Test ToolFilterRegistry
+    print("\n" + "="*50)
+    print("Testing ToolFilterRegistry implementation...")
+    
+    # Test ToolFilterRegistry initialization
+    registry = ToolFilterRegistry()
+    print(f"Registry initialized with {len(registry.get_excluded_tools())} excluded tools")
+    
+    # Test default excluded tools
+    print("\nTesting default excluded tools:")
+    default_excluded = registry.get_excluded_tools()
+    expected_excluded = {'Read', 'Grep', 'LS', 'TodoRead', 'NotebookRead'}
+    
+    print(f"Default excluded tools: {sorted(default_excluded)}")
+    print(f"Expected excluded tools: {sorted(expected_excluded)}")
+    assert default_excluded == expected_excluded, f"Expected {expected_excluded}, got {default_excluded}"
+    
+    # Test tool exclusion checking
+    print("\nTesting tool exclusion checking:")
+    exclusion_test_cases = [
+        {"tool": "Read", "expected": True},
+        {"tool": "Grep", "expected": True},
+        {"tool": "LS", "expected": True},
+        {"tool": "TodoRead", "expected": True},
+        {"tool": "NotebookRead", "expected": True},
+        {"tool": "Write", "expected": False},
+        {"tool": "Edit", "expected": False},
+        {"tool": "Bash", "expected": False},
+        {"tool": "Git", "expected": False},
+        {"tool": "UnknownTool", "expected": False},
+    ]
+    
+    for i, test_case in enumerate(exclusion_test_cases, 1):
+        tool_name = test_case["tool"]
+        expected = test_case["expected"]
+        is_excluded = registry.is_tool_excluded(tool_name)
+        
+        print(f"{i}. {tool_name} -> Excluded: {is_excluded} (Expected: {expected})")
+        assert is_excluded == expected, f"Expected {expected}, got {is_excluded}"
+    
+    # Test filter mapping
+    print("\nTesting filter mapping:")
+    filter_mapping_test_cases = [
+        {"tool": "Bash", "expected_type": "BashFilter"},
+        {"tool": "Git", "expected_type": "GitFilter"},
+        {"tool": "Read", "expected_type": "FileOperationFilter"},
+        {"tool": "Write", "expected_type": "FileOperationFilter"},
+        {"tool": "Edit", "expected_type": "FileOperationFilter"},
+        {"tool": "MultiEdit", "expected_type": "FileOperationFilter"},
+        {"tool": "NotebookRead", "expected_type": "FileOperationFilter"},
+        {"tool": "NotebookEdit", "expected_type": "FileOperationFilter"},
+        {"tool": "Grep", "expected_type": "SearchFilter"},
+        {"tool": "LS", "expected_type": "SearchFilter"},
+        {"tool": "Find", "expected_type": "SearchFilter"},
+        {"tool": "Locate", "expected_type": "SearchFilter"},
+        {"tool": "Which", "expected_type": "SearchFilter"},
+        {"tool": "Whereis", "expected_type": "SearchFilter"},
+        {"tool": "UnknownTool", "expected_type": "DefaultToolFilter"},
+    ]
+    
+    for i, test_case in enumerate(filter_mapping_test_cases, 1):
+        tool_name = test_case["tool"]
+        expected_type = test_case["expected_type"]
+        filter_instance = registry.get_filter(tool_name)
+        actual_type = filter_instance.__class__.__name__
+        
+        print(f"{i}. {tool_name} -> {actual_type} (Expected: {expected_type})")
+        assert actual_type == expected_type, f"Expected {expected_type}, got {actual_type}"
+    
+    # Test should_speak method (main entry point)
+    print("\nTesting registry should_speak method:")
+    registry_speak_test_cases = [
+        # Excluded tools should not speak
+        {"tool": "Read", "data": {"content": "file content"}, "expected": False},
+        {"tool": "Grep", "data": {"output": "match found"}, "expected": False},
+        {"tool": "LS", "data": {"output": "file1.txt\nfile2.txt"}, "expected": False},
+        {"tool": "TodoRead", "data": {"content": "todo items"}, "expected": False},
+        
+        # Non-excluded tools should use their filter logic
+        {"tool": "Write", "data": {"file_path": "test.txt", "content": "Hello"}, "expected": True},
+        {"tool": "Edit", "data": {"file_path": "test.txt", "old_string": "old", "new_string": "new"}, "expected": True},
+        {"tool": "Bash", "data": {"exit_code": 0, "command": "echo hello", "output": "hello"}, "expected": True},
+        {"tool": "Git", "data": {"exit_code": 0, "command": "git commit -m 'test'", "output": "Changes committed"}, "expected": True},
+        
+        # Error cases should speak even for some excluded tools when using custom filters
+        {"tool": "Bash", "data": {"exit_code": 1, "command": "invalid", "stderr": "command not found"}, "expected": True},
+    ]
+    
+    for i, test_case in enumerate(registry_speak_test_cases, 1):
+        tool_name = test_case["tool"]
+        data = test_case["data"]
+        expected = test_case["expected"]
+        should_speak = registry.should_speak(tool_name, data)
+        
+        print(f"{i}. {tool_name} with {data} -> Should speak: {should_speak} (Expected: {expected})")
+        assert should_speak == expected, f"Expected {expected}, got {should_speak}"
+    
+    # Test custom message generation
+    print("\nTesting registry custom message generation:")
+    registry_message_test_cases = [
+        {"tool": "Bash", "data": {"exit_code": 0, "command": "mkdir test"}, "expected_contains": "Directory created"},
+        {"tool": "Git", "data": {"exit_code": 0, "command": "git commit -m 'test'", "output": "Changes committed"}, "expected_contains": "committed"},
+        {"tool": "Write", "data": {"file_path": "test.txt", "content": "Hello"}, "expected_contains": "File created"},
+        {"tool": "Edit", "data": {"file_path": "test.txt", "old_string": "old", "new_string": "new"}, "expected_contains": "File updated"},
+        {"tool": "Grep", "data": {"output": "file.txt:match1\nfile.txt:match2"}, "expected_contains": "Found 2 matches"},
+        {"tool": "LS", "data": {"output": "file1.txt\nfile2.txt\ndir/"}, "expected_contains": "Directory contains 3 items"},
+    ]
+    
+    for i, test_case in enumerate(registry_message_test_cases, 1):
+        tool_name = test_case["tool"]
+        data = test_case["data"]
+        expected_contains = test_case["expected_contains"]
+        message = registry.get_custom_message(tool_name, data)
+        
+        print(f"{i}. {tool_name} -> Message: '{message}'")
+        if message:
+            assert expected_contains.lower() in message.lower(), f"Expected message to contain '{expected_contains}', got '{message}'"
+    
+    # Test exclusion list management
+    print("\nTesting exclusion list management:")
+    
+    # Test adding excluded tool
+    initial_count = len(registry.get_excluded_tools())
+    registry.add_excluded_tool("TestTool")
+    assert len(registry.get_excluded_tools()) == initial_count + 1
+    assert registry.is_tool_excluded("TestTool")
+    print("✓ Successfully added TestTool to exclusion list")
+    
+    # Test removing excluded tool
+    registry.remove_excluded_tool("TestTool")
+    assert len(registry.get_excluded_tools()) == initial_count
+    assert not registry.is_tool_excluded("TestTool")
+    print("✓ Successfully removed TestTool from exclusion list")
+    
+    # Test removing non-existent tool (should not error)
+    registry.remove_excluded_tool("NonExistentTool")
+    assert len(registry.get_excluded_tools()) == initial_count
+    print("✓ Successfully handled removal of non-existent tool")
+    
+    # Test getting available filters
+    print("\nTesting available filters:")
+    available_filters = registry.get_available_filters()
+    expected_filters = {'Bash', 'Git', 'FileOperation', 'Search', 'Default'}
+    
+    print(f"Available filters: {sorted(available_filters.keys())}")
+    print(f"Expected filters: {sorted(expected_filters)}")
+    assert set(available_filters.keys()) == expected_filters, f"Expected {expected_filters}, got {set(available_filters.keys())}"
+    
+    # Test configuration info
+    print("\nTesting configuration info:")
+    config_info = registry.get_configuration_info()
+    required_keys = {'excluded_tools', 'default_excluded_tools', 'configuration', 'available_filters'}
+    
+    print(f"Configuration info keys: {sorted(config_info.keys())}")
+    assert set(config_info.keys()) == required_keys, f"Expected keys {required_keys}, got {set(config_info.keys())}"
+    
+    # Test global registry functions
+    print("\nTesting global registry functions:")
+    global_registry = get_global_registry()
+    assert isinstance(global_registry, ToolFilterRegistry)
+    print("✓ Global registry created successfully")
+    
+    # Test that multiple calls return the same instance
+    global_registry2 = get_global_registry()
+    assert global_registry is global_registry2
+    print("✓ Global registry singleton pattern working")
+    
+    # Test registry reinitialization
+    initialize_global_registry()
+    global_registry3 = get_global_registry()
+    assert global_registry3 is not global_registry  # Should be a new instance
+    print("✓ Global registry reinitialization working")
+    
+    # Test configuration loading with mock settings
+    print("\nTesting configuration loading with mock settings:")
+    
+    # Create a temporary settings file for testing
+    import tempfile
+    import json
+    import os
+    
+    mock_settings = {
+        "tts_settings": {
+            "excluded_tools": ["Read", "Grep", "MockTool"],
+            "filter_settings": {
+                "bash": {"speak_success": False, "speak_errors": True},
+                "search": {"speak_search_results": True, "speak_errors": False}
+            }
+        }
+    }
+    
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump(mock_settings, f)
+        temp_settings_path = f.name
+    
+    try:
+        # Test registry with custom settings
+        custom_registry = ToolFilterRegistry(temp_settings_path)
+        
+        # Check excluded tools were loaded
+        excluded_tools = custom_registry.get_excluded_tools()
+        expected_excluded = {"Read", "Grep", "MockTool"}
+        assert excluded_tools == expected_excluded, f"Expected {expected_excluded}, got {excluded_tools}"
+        print("✓ Custom excluded tools loaded correctly")
+        
+        # Check filter configuration was applied
+        bash_filter = custom_registry.filter_instances['Bash']
+        assert bash_filter.speak_success == False
+        assert bash_filter.speak_errors == True
+        print("✓ Bash filter configuration applied correctly")
+        
+        search_filter = custom_registry.filter_instances['Search']
+        assert search_filter.speak_search_results == True
+        assert search_filter.speak_errors == False
+        print("✓ Search filter configuration applied correctly")
+        
+        # Test reload configuration
+        custom_registry.reload_configuration()
+        reloaded_excluded = custom_registry.get_excluded_tools()
+        assert reloaded_excluded == expected_excluded
+        print("✓ Configuration reload working correctly")
+        
+    finally:
+        # Clean up temporary file
+        os.unlink(temp_settings_path)
+    
+    print("\nToolFilterRegistry implementation testing complete!")
+    
+    # Test MessageTemplate system
+    print("\n" + "="*50)
+    print("Testing MessageTemplate system...")
+    
+    # Test MessageTemplate class
+    print("\nTesting MessageTemplate class:")
+    
+    # Test basic template without variables
+    simple_template = MessageTemplate("Operation completed successfully")
+    simple_message = simple_template.generate_message({})
+    print(f"Simple template: '{simple_message}'")
+    assert simple_message == "Operation completed successfully"
+    
+    # Test template with variables
+    file_template = MessageTemplate(
+        "File {filename} updated successfully",
+        {"filename": "filename"}
+    )
+    file_data = {"file_path": "/path/to/test.txt"}
+    file_message = file_template.generate_message(file_data)
+    print(f"File template: '{file_message}'")
+    assert file_message == "File test.txt updated successfully"
+    
+    # Test template with count variable
+    count_template = MessageTemplate(
+        "Found {count} matches",
+        {"count": "count"}
+    )
+    count_data = {"count": 5}
+    count_message = count_template.generate_message(count_data)
+    print(f"Count template: '{count_message}'")
+    assert count_message == "Found 5 matches"
+    
+    # Test template with multiple variables
+    multi_template = MessageTemplate(
+        "Applied {count} edits to {filename}",
+        {"count": "count", "filename": "filename"}
+    )
+    multi_data = {"edit_count": 3, "file_path": "/src/app.js"}
+    multi_message = multi_template.generate_message(multi_data)
+    print(f"Multi-variable template: '{multi_message}'")
+    assert multi_message == "Applied 3 edits to app.js"
+    
+    # Test template with missing variables (should return None)
+    missing_template = MessageTemplate(
+        "File {filename} processed",
+        {"filename": "filename"}
+    )
+    missing_message = missing_template.generate_message({})
+    print(f"Missing variable template: '{missing_message}'")
+    assert missing_message is None
+    
+    # Test message length optimization
+    long_template = MessageTemplate(
+        "This is a very long message that should be truncated because it exceeds the maximum length limit for TTS optimization purposes"
+    )
+    long_template.set_max_length(50)
+    long_message = long_template.generate_message({})
+    print(f"Long message (truncated): '{long_message}'")
+    assert len(long_message) <= 50
+    assert long_message.endswith("...")
+    
+    # Test regex pattern extraction
+    regex_template = MessageTemplate(
+        "Extracted: {value}",
+        {"value": "regex:result: (\\w+)"}
+    )
+    regex_data = {"output": "operation result: success completed"}
+    regex_message = regex_template.generate_message(regex_data)
+    print(f"Regex template: '{regex_message}'")
+    assert regex_message == "Extracted: success"
+    
+    # Test special pattern extraction
+    special_patterns_tests = [
+        # Test exit_code pattern
+        (MessageTemplate("Exit code: {code}", {"code": "exit_code"}), 
+         {"exit_code": 0}, "Exit code: 0"),
+        
+        # Test command pattern
+        (MessageTemplate("Command: {cmd}", {"cmd": "command"}), 
+         {"command": "git commit"}, "Command: git commit"),
+        
+        # Test status pattern
+        (MessageTemplate("Status: {status}", {"status": "status"}), 
+         {"status": "success"}, "Status: success"),
+    ]
+    
+    for template, data, expected in special_patterns_tests:
+        result = template.generate_message(data)
+        print(f"Special pattern test: '{result}' (expected: '{expected}')")
+        assert result == expected
+    
+    print("✓ MessageTemplate class tests passed")
+    
+    # Test MessageTemplateRegistry
+    print("\nTesting MessageTemplateRegistry:")
+    
+    # Test registry initialization
+    registry = MessageTemplateRegistry()
+    template_names = registry.list_templates()
+    print(f"Registry initialized with {len(template_names)} templates")
+    
+    # Test getting templates
+    bash_success_template = registry.get_template("bash_success")
+    assert bash_success_template is not None
+    success_message = bash_success_template.generate_message({})
+    print(f"Bash success template: '{success_message}'")
+    assert success_message == "Command completed successfully"
+    
+    # Test generating messages through registry
+    file_created_message = registry.generate_message("file_created", {"file_path": "/test/new.txt"})
+    print(f"File created message: '{file_created_message}'")
+    assert file_created_message == "File created: new.txt"
+    
+    # Test generating messages with counts
+    grep_results_message = registry.generate_message("grep_results", {"count": 7})
+    print(f"Grep results message: '{grep_results_message}'")
+    assert grep_results_message == "Found 7 matches"
+    
+    # Test templates for specific tools
+    bash_templates = registry.get_templates_for_tool("Bash")
+    print(f"Bash templates: {sorted(bash_templates)}")
+    assert "bash_success" in bash_templates
+    assert "bash_error" in bash_templates
+    assert "generic_success" in bash_templates
+    
+    git_templates = registry.get_templates_for_tool("Git")
+    print(f"Git templates: {sorted(git_templates)}")
+    assert "git_commit" in git_templates
+    assert "git_push" in git_templates
+    assert "generic_error" in git_templates
+    
+    file_templates = registry.get_templates_for_tool("Edit")
+    print(f"Edit templates: {sorted(file_templates)}")
+    assert "file_updated" in file_templates
+    assert "multi_edit" in file_templates
+    assert "generic_success" in file_templates
+    
+    # Test adding and removing templates
+    custom_template = MessageTemplate("Custom operation: {result}", {"result": "status"})
+    registry.add_template("custom_test", custom_template)
+    
+    custom_message = registry.generate_message("custom_test", {"status": "completed"})
+    print(f"Custom template message: '{custom_message}'")
+    assert custom_message == "Custom operation: completed"
+    
+    registry.remove_template("custom_test")
+    removed_message = registry.generate_message("custom_test", {"status": "completed"})
+    print(f"Removed template message: '{removed_message}'")
+    assert removed_message is None
+    
+    print("✓ MessageTemplateRegistry tests passed")
+    
+    # Test global template registry
+    print("\nTesting global template registry:")
+    
+    global_registry = get_global_template_registry()
+    assert isinstance(global_registry, MessageTemplateRegistry)
+    
+    # Test singleton behavior
+    global_registry2 = get_global_template_registry()
+    assert global_registry is global_registry2
+    
+    # Test reinitialization
+    initialize_global_template_registry()
+    global_registry3 = get_global_template_registry()
+    assert global_registry3 is not global_registry
+    
+    print("✓ Global template registry tests passed")
+    
+    # Test template integration with existing filters
+    print("\nTesting template integration with filters:")
+    
+    # Test BashFilter with template messages
+    bash_filter = BashFilter()
+    bash_success_data = {"exit_code": 0, "command": "mkdir test_dir"}
+    bash_message = bash_filter.get_custom_message("Bash", bash_success_data)
+    print(f"Bash filter message: '{bash_message}'")
+    
+    # Test FileOperationFilter with template messages
+    file_filter = FileOperationFilter()
+    file_success_data = {"file_path": "/path/to/document.txt", "content": "Hello World"}
+    file_message = file_filter.get_custom_message("Write", file_success_data)
+    print(f"File filter message: '{file_message}'")
+    
+    # Test SearchFilter with template messages
+    search_filter = SearchFilter()
+    search_success_data = {"output": "file1.txt:match1\nfile2.txt:match2"}
+    search_message = search_filter.get_custom_message("Grep", search_success_data)
+    print(f"Search filter message: '{search_message}'")
+    
+    print("✓ Template integration tests passed")
+    
+    # Test comprehensive message generation scenarios
+    print("\nTesting comprehensive message generation scenarios:")
+    
+    comprehensive_test_cases = [
+        # Bash operations
+        {"template": "bash_success", "data": {}, "expected": "Command completed successfully"},
+        {"template": "bash_error", "data": {"exit_code": 1}, "expected": "Command failed with exit code 1"},
+        {"template": "bash_mkdir", "data": {}, "expected": "Directory created"},
+        
+        # Git operations
+        {"template": "git_commit", "data": {}, "expected": "Changes committed successfully"},
+        {"template": "git_push", "data": {}, "expected": "Pushed to remote"},
+        {"template": "git_pull", "data": {}, "expected": "Repository updated"},
+        
+        # File operations
+        {"template": "file_created", "data": {"file_path": "/src/main.py"}, "expected": "File created: main.py"},
+        {"template": "file_updated", "data": {"filepath": "/config/settings.json"}, "expected": "File updated: settings.json"},
+        {"template": "multi_edit", "data": {"edit_count": 4, "file_path": "/app/utils.js"}, "expected": "Applied 4 edits to utils.js"},
+        
+        # Search operations
+        {"template": "grep_results", "data": {"count": 3}, "expected": "Found 3 matches"},
+        {"template": "grep_no_results", "data": {}, "expected": "No matches found"},
+        {"template": "ls_results", "data": {"count": 5}, "expected": "Directory contains 5 items"},
+        {"template": "ls_empty", "data": {}, "expected": "Directory is empty"},
+        
+        # Error cases
+        {"template": "file_not_found", "data": {"file_path": "/missing/file.txt"}, "expected": "File not found: file.txt"},
+        {"template": "permission_denied", "data": {}, "expected": "Permission denied"},
+        {"template": "generic_error", "data": {}, "expected": "Operation failed"},
+    ]
+    
+    for test_case in comprehensive_test_cases:
+        template_name = test_case["template"]
+        data = test_case["data"]
+        expected = test_case["expected"]
+        
+        result = registry.generate_message(template_name, data)
+        print(f"Template '{template_name}': '{result}' (expected: '{expected}')")
+        assert result == expected, f"Expected '{expected}', got '{result}'"
+    
+    print("✓ Comprehensive message generation tests passed")
+    
+    # Test error handling and fallback behavior
+    print("\nTesting error handling and fallback behavior:")
+    
+    # Test template with invalid format string (missing variable)
+    invalid_template = MessageTemplate("Invalid {nonexistent} template", {"nonexistent": "nonexistent_field"})
+    invalid_result = invalid_template.generate_message({"file_path": "/test.txt"})
+    print(f"Invalid template result: '{invalid_result}'")
+    assert invalid_result is None
+    
+    # Test template with malformed regex
+    malformed_regex_template = MessageTemplate("Result: {value}", {"value": "regex:["})
+    malformed_result = malformed_regex_template.generate_message({"output": "test data"})
+    print(f"Malformed regex template result: '{malformed_result}'")
+    assert malformed_result is None
+    
+    # Test registry with non-existent template
+    non_existent_result = registry.generate_message("non_existent_template", {})
+    print(f"Non-existent template result: '{non_existent_result}'")
+    assert non_existent_result is None
+    
+    # Test template with partial variable matching
+    partial_template = MessageTemplate("Result: {count} items in {filename}", {"count": "count", "filename": "filename"})
+    partial_data = {"count": 5}  # Missing filename
+    partial_result = partial_template.generate_message(partial_data)
+    print(f"Partial variable template result: '{partial_result}'")
+    assert partial_result is None
+    
+    print("✓ Error handling tests passed")
+    
+    print("\nMessageTemplate system testing complete!")
+    
+    # Test integration with the complete system
+    print("\n" + "="*50)
+    print("Testing complete TTS filtering system integration...")
+    
+    # Create a complete filtering scenario
+    filter_registry = ToolFilterRegistry()
+    template_registry = get_global_template_registry()
+    
+    # Test end-to-end scenarios
+    integration_test_cases = [
+        # Bash command success (mkdir is silent by default)
+        {"tool": "Bash", "data": {"exit_code": 0, "command": "mkdir project"}, "should_speak": False},
+        
+        # Bash command error
+        {"tool": "Bash", "data": {"exit_code": 1, "command": "invalid_command", "stderr": "command not found"}, "should_speak": True},
+        
+        # Git commit
+        {"tool": "Git", "data": {"exit_code": 0, "command": "git commit -m 'test'", "output": "Changes committed"}, "should_speak": True},
+        
+        # File write operation
+        {"tool": "Write", "data": {"file_path": "/src/app.py", "content": "print('hello')"}, "should_speak": True},
+        
+        # File read operation (should be excluded)
+        {"tool": "Read", "data": {"file_path": "/src/app.py", "content": "print('hello')"}, "should_speak": False},
+        
+        # Grep search (should be excluded)
+        {"tool": "Grep", "data": {"output": "file.txt:match1\nfile.txt:match2"}, "should_speak": False},
+        
+        # LS directory listing (should be excluded)
+        {"tool": "LS", "data": {"output": "file1.txt\nfile2.txt\ndir/"}, "should_speak": False},
+        
+        # MultiEdit operation
+        {"tool": "MultiEdit", "data": {"file_path": "/config/settings.json", "edit_count": 3}, "should_speak": True},
+    ]
+    
+    for test_case in integration_test_cases:
+        tool_name = test_case["tool"]
+        data = test_case["data"]
+        expected_speak = test_case["should_speak"]
+        
+        should_speak = filter_registry.should_speak(tool_name, data)
+        custom_message = filter_registry.get_custom_message(tool_name, data)
+        
+        print(f"Tool '{tool_name}': should_speak={should_speak} (expected: {expected_speak}), message='{custom_message}'")
+        assert should_speak == expected_speak, f"Expected should_speak={expected_speak}, got {should_speak}"
+    
+    print("✓ Complete system integration tests passed")
+    
+    print("\n" + "="*50)
+    print("ALL TESTS PASSED! TTS filtering system is ready for production use.")
+    print("="*50)

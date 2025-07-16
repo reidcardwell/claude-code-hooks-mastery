@@ -412,6 +412,49 @@ These commands make AI calls and may take up to a minute:
 - Provides more informed task creation and updates
 - Recommended for complex technical tasks
 
+## Hook Development Safety Protocol
+
+### CRITICAL: Hook Rollback Instructions
+
+**⚠️ BEFORE ANY HOOK MODIFICATIONS:**
+Any changes to Claude Code hooks (`.claude/hooks/`) must include rollback instructions to prevent system breakage.
+
+#### Pre-Modification Checklist
+1. **Backup Current State**: Always create backup before changes
+2. **Document Rollback**: Provide exact rollback commands
+3. **Test Incrementally**: Test changes in isolation first
+4. **Validate Function**: Ensure hooks work before proceeding
+
+#### Standard Rollback Commands
+
+```bash
+# Emergency Hook Disable (if system breaks)
+mv .claude/hooks/problematic_hook.py .claude/hooks/problematic_hook.py.disabled
+
+# Restore from backup
+cp .claude/hooks/backup/hook_name.py .claude/hooks/hook_name.py
+
+# Reset to working state
+git checkout HEAD -- .claude/hooks/hook_name.py
+
+# Restart Claude Code session
+# Exit current session, restart: claude
+```
+
+#### Hook Modification Template
+
+Before making changes, always provide:
+```markdown
+## Rollback Instructions for [Hook Name]
+**Current Working State**: [describe current functionality]
+**Backup Command**: `cp .claude/hooks/hook_name.py .claude/hooks/backup/hook_name.py.backup`
+**Rollback Command**: `cp .claude/hooks/backup/hook_name.py.backup .claude/hooks/hook_name.py`
+**Emergency Disable**: `mv .claude/hooks/hook_name.py .claude/hooks/hook_name.py.disabled`
+**Restart Required**: Yes/No
+```
+
+This ensures you can always restore working hook functionality if modifications cause issues.
+
 ---
 
 _This guide ensures Claude Code has immediate access to Task Master's essential functionality for agentic development workflows._

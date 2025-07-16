@@ -6,7 +6,33 @@
 import json
 import os
 import sys
+import time
 from pathlib import Path
+
+# TTS Components - Conditional imports to handle missing components gracefully
+try:
+    from utils.tts.text_processor import extract_text_from_response, word_count, strip_ansi_codes
+    from utils.tts.tool_filters import (
+        ToolFilterRegistry, 
+        get_global_registry,
+        BashFilter,
+        GitFilter, 
+        FileOperationFilter,
+        SearchFilter
+    )
+    from utils.tts.elevenlabs_client import TTSClient
+    TTS_AVAILABLE = True
+except ImportError as e:
+    TTS_AVAILABLE = False
+    # Fallback functions for when TTS components aren't available
+    def extract_text_from_response(response):
+        return str(response) if response else ""
+    
+    def word_count(text):
+        return len(text.split()) if text else 0
+    
+    def strip_ansi_codes(text):
+        return text
 
 def main():
     try:

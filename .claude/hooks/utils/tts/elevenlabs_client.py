@@ -100,6 +100,23 @@ class RetryDecision(Enum):
     ESCALATE = "escalate"
 
 
+class QueuePriority(Enum):
+    """Priority levels for request queue."""
+    LOW = 1
+    NORMAL = 2
+    HIGH = 3
+    URGENT = 4
+
+
+class QueueOverflowStrategy(Enum):
+    """Strategies for handling queue overflow."""
+    DROP_OLDEST = "drop_oldest"
+    DROP_NEWEST = "drop_newest"
+    DROP_LOWEST_PRIORITY = "drop_lowest_priority"
+    REJECT = "reject"
+    BLOCK = "block"
+
+
 @dataclass
 class RetryConfig:
     """Configuration for retry logic with exponential backoff."""
@@ -343,6 +360,63 @@ class VoiceInfo:
 
 
 @dataclass
+class TokenBucketConfig:
+    """Configuration for token bucket rate limiting."""
+    capacity: int = 100  # Maximum tokens in bucket
+    refill_rate: float = 10.0  # Tokens per second
+    initial_tokens: int = None  # Initial tokens (defaults to capacity)
+    burst_capacity: int = None  # Allow burst up to this many tokens
+    
+    def __post_init__(self):
+        if self.initial_tokens is None:
+            self.initial_tokens = self.capacity
+        if self.burst_capacity is None:
+            self.burst_capacity = self.capacity
+
+
+@dataclass
+class QueueConfig:
+    """Configuration for request queue system."""
+    max_size: int = 1000  # Maximum queue size
+    overflow_strategy: QueueOverflowStrategy = QueueOverflowStrategy.DROP_OLDEST
+    priority_enabled: bool = True
+    persistence_enabled: bool = False
+    persistence_file: str = ".tts_queue_backup.json"
+    queue_timeout: float = 30.0  # Maximum time to wait for queue slot
+    worker_threads: int = 3  # Number of worker threads
+    
+    
+@dataclass
+class RateLimitConfig:
+    """Configuration for rate limiting."""
+    enabled: bool = True
+    requests_per_second: float = 10.0
+    burst_requests: int = 50
+    adaptive_enabled: bool = True
+    respect_headers: bool = True
+    token_bucket: TokenBucketConfig = field(default_factory=TokenBucketConfig)
+    queue: QueueConfig = field(default_factory=QueueConfig)
+
+
+@dataclass
+class QueuedRequest:
+    """Represents a queued request with priority and metadata."""
+    func: Callable
+    args: tuple
+    kwargs: dict
+    priority: QueuePriority = QueuePriority.NORMAL
+    created_at: float = field(default_factory=time.time)
+    request_id: str = field(default_factory=lambda: f"req_{int(time.time() * 1000)}")
+    timeout: float = 30.0
+    retries: int = 0
+    max_retries: int = 3
+    
+    def __lt__(self, other):
+        """Compare requests by priority (higher priority = lower number for heapq)."""
+        return (-self.priority.value, self.created_at) < (-other.priority.value, other.created_at)
+
+
+@dataclass
 class ConnectionPoolConfig:
     """Configuration for connection pooling."""
     pool_connections: int = 10
@@ -532,6 +606,493 @@ class SessionManager:
         self.close()
 
 
+class TokenBucket:
+    """Thread-safe token bucket for rate limiting."""
+    
+    def __init__(self, config: TokenBucketConfig):
+        self.config = config
+        self.tokens = float(config.initial_tokens)
+        self.last_refill = time.time()
+        self.lock = threading.RLock()
+        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        
+    def _refill(self):
+        """Refill tokens based on elapsed time."""
+        now = time.time()
+        elapsed = now - self.last_refill
+        
+        if elapsed > 0:
+            # Calculate tokens to add
+            tokens_to_add = elapsed * self.config.refill_rate
+            
+            # Add tokens, respecting capacity
+            self.tokens = min(self.config.capacity, self.tokens + tokens_to_add)
+            self.last_refill = now
+            
+            if tokens_to_add > 0:
+                self.logger.debug(f"Refilled {tokens_to_add:.2f} tokens, now have {self.tokens:.2f}")
+    
+    def consume(self, tokens: float = 1.0, timeout: float = None) -> bool:
+        """
+        Consume tokens from the bucket.
+        
+        Args:
+            tokens: Number of tokens to consume
+            timeout: Maximum time to wait for tokens (None = don't wait)
+            
+        Returns:
+            bool: True if tokens were consumed, False otherwise
+        """
+        with self.lock:
+            self._refill()
+            
+            if self.tokens >= tokens:
+                self.tokens -= tokens
+                self.logger.debug(f"Consumed {tokens} tokens, {self.tokens:.2f} remaining")
+                return True
+            
+            if timeout is None or timeout <= 0:
+                self.logger.debug(f"Insufficient tokens: need {tokens}, have {self.tokens:.2f}")
+                return False
+            
+            # Wait for tokens to become available
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                time.sleep(0.1)  # Small sleep to avoid busy waiting
+                self._refill()
+                
+                if self.tokens >= tokens:
+                    self.tokens -= tokens
+                    self.logger.debug(f"Consumed {tokens} tokens after waiting, {self.tokens:.2f} remaining")
+                    return True
+            
+            self.logger.debug(f"Timeout waiting for tokens: need {tokens}, have {self.tokens:.2f}")
+            return False
+    
+    def available_tokens(self) -> float:
+        """Get the current number of available tokens."""
+        with self.lock:
+            self._refill()
+            return self.tokens
+    
+    def wait_time(self, tokens: float = 1.0) -> float:
+        """Calculate time to wait for specified tokens to become available."""
+        with self.lock:
+            self._refill()
+            
+            if self.tokens >= tokens:
+                return 0.0
+            
+            tokens_needed = tokens - self.tokens
+            return tokens_needed / self.config.refill_rate
+    
+    def reset(self):
+        """Reset the bucket to initial state."""
+        with self.lock:
+            self.tokens = float(self.config.initial_tokens)
+            self.last_refill = time.time()
+            self.logger.debug(f"Token bucket reset to {self.tokens} tokens")
+
+
+class RequestQueue:
+    """Thread-safe priority queue for TTS requests."""
+    
+    def __init__(self, config: QueueConfig):
+        self.config = config
+        self.queue = []  # Priority queue using heapq
+        self.lock = threading.RLock()
+        self.not_empty = threading.Condition(self.lock)
+        self.not_full = threading.Condition(self.lock)
+        self.shutdown = False
+        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        
+        # Load persisted queue if enabled
+        if self.config.persistence_enabled:
+            self._load_from_persistence()
+    
+    def _load_from_persistence(self):
+        """Load queue from persistence file."""
+        try:
+            if os.path.exists(self.config.persistence_file):
+                with open(self.config.persistence_file, 'r') as f:
+                    data = json.load(f)
+                    self.logger.info(f"Loaded {len(data)} requests from persistence")
+        except Exception as e:
+            self.logger.error(f"Failed to load queue from persistence: {e}")
+    
+    def _save_to_persistence(self):
+        """Save queue to persistence file."""
+        if not self.config.persistence_enabled:
+            return
+            
+        try:
+            # Convert queue to serializable format
+            serializable_queue = []
+            for req in self.queue:
+                serializable_queue.append({
+                    'request_id': req.request_id,
+                    'priority': req.priority.value,
+                    'created_at': req.created_at,
+                    'timeout': req.timeout,
+                    'retries': req.retries
+                })
+            
+            with open(self.config.persistence_file, 'w') as f:
+                json.dump(serializable_queue, f)
+                
+        except Exception as e:
+            self.logger.error(f"Failed to save queue to persistence: {e}")
+    
+    def put(self, request: QueuedRequest, block: bool = True, timeout: float = None) -> bool:
+        """
+        Put a request in the queue.
+        
+        Args:
+            request: The request to queue
+            block: Whether to block if queue is full
+            timeout: Maximum time to wait if blocking
+            
+        Returns:
+            bool: True if request was queued, False otherwise
+        """
+        with self.not_full:
+            if self.shutdown:
+                return False
+            
+            # Check if queue is full
+            if len(self.queue) >= self.config.max_size:
+                if not block:
+                    return False
+                
+                # Handle overflow based on strategy
+                if self.config.overflow_strategy == QueueOverflowStrategy.REJECT:
+                    self.logger.warning("Queue full, rejecting request")
+                    return False
+                elif self.config.overflow_strategy == QueueOverflowStrategy.BLOCK:
+                    if not self.not_full.wait(timeout):
+                        self.logger.warning("Timeout waiting for queue space")
+                        return False
+                else:
+                    # Handle dropping strategies
+                    self._handle_overflow()
+            
+            # Add to queue
+            import heapq
+            heapq.heappush(self.queue, request)
+            
+            self.logger.debug(f"Queued request {request.request_id} with priority {request.priority.name}")
+            
+            # Notify waiting consumers
+            with self.not_empty:
+                self.not_empty.notify()
+            
+            # Save to persistence if enabled
+            self._save_to_persistence()
+            
+            return True
+    
+    def get(self, block: bool = True, timeout: float = None) -> Optional[QueuedRequest]:
+        """
+        Get a request from the queue.
+        
+        Args:
+            block: Whether to block if queue is empty
+            timeout: Maximum time to wait if blocking
+            
+        Returns:
+            QueuedRequest or None: The next request, or None if timeout/shutdown
+        """
+        with self.not_empty:
+            if self.shutdown and not self.queue:
+                return None
+            
+            if not self.queue:
+                if not block:
+                    return None
+                
+                if not self.not_empty.wait(timeout):
+                    return None
+            
+            if self.queue:
+                import heapq
+                request = heapq.heappop(self.queue)
+                
+                self.logger.debug(f"Dequeued request {request.request_id}")
+                
+                # Notify waiting producers
+                with self.not_full:
+                    self.not_full.notify()
+                
+                # Save to persistence if enabled
+                self._save_to_persistence()
+                
+                return request
+            
+            return None
+    
+    def _handle_overflow(self):
+        """Handle queue overflow based on configured strategy."""
+        if not self.queue:
+            return
+            
+        import heapq
+        
+        if self.config.overflow_strategy == QueueOverflowStrategy.DROP_OLDEST:
+            # Remove oldest request (last in priority queue)
+            removed = self.queue.pop()
+            heapq.heapify(self.queue)
+            self.logger.warning(f"Dropped oldest request {removed.request_id}")
+            
+        elif self.config.overflow_strategy == QueueOverflowStrategy.DROP_NEWEST:
+            # Don't add the new request (handled by caller)
+            pass
+            
+        elif self.config.overflow_strategy == QueueOverflowStrategy.DROP_LOWEST_PRIORITY:
+            # Find and remove lowest priority request
+            if self.queue:
+                lowest_priority_idx = 0
+                lowest_priority = self.queue[0].priority.value
+                
+                for i, req in enumerate(self.queue):
+                    if req.priority.value < lowest_priority:
+                        lowest_priority = req.priority.value
+                        lowest_priority_idx = i
+                
+                removed = self.queue.pop(lowest_priority_idx)
+                heapq.heapify(self.queue)
+                self.logger.warning(f"Dropped lowest priority request {removed.request_id}")
+    
+    def size(self) -> int:
+        """Get current queue size."""
+        with self.lock:
+            return len(self.queue)
+    
+    def empty(self) -> bool:
+        """Check if queue is empty."""
+        with self.lock:
+            return len(self.queue) == 0
+    
+    def full(self) -> bool:
+        """Check if queue is full."""
+        with self.lock:
+            return len(self.queue) >= self.config.max_size
+    
+    def shutdown_queue(self):
+        """Shutdown the queue and notify all waiting threads."""
+        with self.lock:
+            self.shutdown = True
+            with self.not_empty:
+                self.not_empty.notify_all()
+            with self.not_full:
+                self.not_full.notify_all()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get queue statistics."""
+        with self.lock:
+            priority_counts = {}
+            for req in self.queue:
+                priority_counts[req.priority.name] = priority_counts.get(req.priority.name, 0) + 1
+            
+            return {
+                "size": len(self.queue),
+                "max_size": self.config.max_size,
+                "utilization": len(self.queue) / self.config.max_size,
+                "priority_counts": priority_counts,
+                "shutdown": self.shutdown
+            }
+
+
+class RateLimitManager:
+    """Manages rate limiting and request queuing for TTS API calls."""
+    
+    def __init__(self, config: RateLimitConfig):
+        self.config = config
+        self.token_bucket = TokenBucket(config.token_bucket)
+        self.request_queue = RequestQueue(config.queue)
+        self.adaptive_limits = {}
+        self.last_response_headers = {}
+        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        
+        # Statistics
+        self.stats = {
+            "requests_processed": 0,
+            "requests_queued": 0,
+            "requests_rejected": 0,
+            "rate_limit_hits": 0,
+            "adaptive_adjustments": 0
+        }
+        
+        # Worker threads for processing queue
+        self.workers = []
+        self.shutdown = False
+        
+        if self.config.enabled:
+            self._start_workers()
+    
+    def _start_workers(self):
+        """Start worker threads for processing queue."""
+        for i in range(self.config.queue.worker_threads):
+            worker = threading.Thread(
+                target=self._worker_loop,
+                name=f"RateLimitWorker-{i}",
+                daemon=True
+            )
+            worker.start()
+            self.workers.append(worker)
+        
+        self.logger.info(f"Started {len(self.workers)} rate limit workers")
+    
+    def _worker_loop(self):
+        """Worker thread loop for processing queued requests."""
+        while not self.shutdown:
+            try:
+                request = self.request_queue.get(timeout=1.0)
+                if request is None:
+                    continue
+                
+                # Wait for tokens
+                if not self.token_bucket.consume(1.0, timeout=request.timeout):
+                    self.logger.warning(f"Request {request.request_id} timed out waiting for tokens")
+                    self.stats["requests_rejected"] += 1
+                    continue
+                
+                # Execute the request
+                try:
+                    result = request.func(*request.args, **request.kwargs)
+                    self.stats["requests_processed"] += 1
+                    
+                except Exception as e:
+                    self.logger.error(f"Request {request.request_id} failed: {e}")
+                    
+                    # Retry if configured
+                    if request.retries < request.max_retries:
+                        request.retries += 1
+                        self.request_queue.put(request, block=False)
+                        self.logger.info(f"Retrying request {request.request_id} (attempt {request.retries})")
+                    else:
+                        self.stats["requests_rejected"] += 1
+                        
+            except Exception as e:
+                self.logger.error(f"Worker error: {e}")
+    
+    def submit_request(self, func: Callable, *args, priority: QueuePriority = QueuePriority.NORMAL, timeout: float = 30.0, **kwargs) -> bool:
+        """
+        Submit a request to the rate limiter.
+        
+        Args:
+            func: Function to execute
+            *args: Arguments for the function
+            priority: Request priority
+            timeout: Request timeout
+            **kwargs: Keyword arguments for the function
+            
+        Returns:
+            bool: True if request was queued, False otherwise
+        """
+        if not self.config.enabled:
+            # Direct execution if rate limiting is disabled
+            try:
+                func(*args, **kwargs)
+                return True
+            except Exception as e:
+                self.logger.error(f"Direct execution failed: {e}")
+                return False
+        
+        request = QueuedRequest(
+            func=func,
+            args=args,
+            kwargs=kwargs,
+            priority=priority,
+            timeout=timeout
+        )
+        
+        if self.request_queue.put(request, block=False):
+            self.stats["requests_queued"] += 1
+            return True
+        else:
+            self.stats["requests_rejected"] += 1
+            return False
+    
+    def update_from_response_headers(self, headers: Dict[str, str]):
+        """Update rate limits based on API response headers."""
+        if not self.config.respect_headers:
+            return
+            
+        self.last_response_headers = headers
+        
+        # Parse common rate limit headers
+        remaining = headers.get('X-RateLimit-Remaining', headers.get('X-RateLimit-Limit-Remaining'))
+        reset_time = headers.get('X-RateLimit-Reset', headers.get('X-RateLimit-Reset-Time'))
+        limit = headers.get('X-RateLimit-Limit', headers.get('X-RateLimit-Limit-Limit'))
+        
+        if remaining is not None:
+            try:
+                remaining = int(remaining)
+                if remaining < 5:  # Low remaining requests
+                    self.stats["rate_limit_hits"] += 1
+                    self.logger.warning(f"Rate limit approaching: {remaining} requests remaining")
+                    
+                    # Adjust token bucket if adaptive limiting is enabled
+                    if self.config.adaptive_enabled:
+                        self._adjust_rate_limit(remaining)
+                        
+            except (ValueError, TypeError):
+                pass
+        
+        if reset_time is not None:
+            try:
+                reset_time = int(reset_time)
+                current_time = int(time.time())
+                
+                if reset_time > current_time:
+                    wait_time = reset_time - current_time
+                    self.logger.info(f"Rate limit resets in {wait_time} seconds")
+                    
+            except (ValueError, TypeError):
+                pass
+    
+    def _adjust_rate_limit(self, remaining_requests: int):
+        """Adjust rate limits based on remaining requests."""
+        if remaining_requests < 5:
+            # Slow down significantly
+            new_rate = max(1.0, self.config.requests_per_second * 0.1)
+        elif remaining_requests < 10:
+            # Moderate slowdown
+            new_rate = max(2.0, self.config.requests_per_second * 0.5)
+        else:
+            # Normal rate
+            new_rate = self.config.requests_per_second
+        
+        if new_rate != self.token_bucket.config.refill_rate:
+            self.token_bucket.config.refill_rate = new_rate
+            self.stats["adaptive_adjustments"] += 1
+            self.logger.info(f"Adjusted rate limit to {new_rate} requests/second")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get rate limiting statistics."""
+        return {
+            **self.stats,
+            "token_bucket": {
+                "available_tokens": self.token_bucket.available_tokens(),
+                "capacity": self.token_bucket.config.capacity,
+                "refill_rate": self.token_bucket.config.refill_rate
+            },
+            "queue": self.request_queue.get_stats(),
+            "last_headers": self.last_response_headers
+        }
+    
+    def shutdown_manager(self):
+        """Shutdown the rate limit manager."""
+        self.shutdown = True
+        self.request_queue.shutdown_queue()
+        
+        # Wait for workers to finish
+        for worker in self.workers:
+            worker.join(timeout=5.0)
+        
+        self.logger.info("Rate limit manager shutdown complete")
+
+
 @dataclass
 class TTSConfig:
     """Configuration settings for TTS client."""
@@ -552,6 +1113,9 @@ class TTSConfig:
     # Advanced retry configuration
     retry_config: Optional[RetryConfig] = None
     
+    # Rate limiting configuration
+    rate_limit_config: Optional[RateLimitConfig] = None
+    
     def __post_init__(self):
         """Validate configuration after initialization."""
         if not self.api_key:
@@ -569,6 +1133,18 @@ class TTSConfig:
                 max_delay=self.max_retry_delay,
                 backoff_factor=self.backoff_factor,
                 strategy=RetryStrategy.EXPONENTIAL
+            )
+        
+        # Initialize rate limiting configuration if not provided
+        if self.rate_limit_config is None:
+            self.rate_limit_config = RateLimitConfig(
+                enabled=True,
+                requests_per_second=self.rate_limit_requests / self.rate_limit_window,
+                burst_requests=self.rate_limit_requests,
+                token_bucket=TokenBucketConfig(
+                    capacity=self.rate_limit_requests,
+                    refill_rate=self.rate_limit_requests / self.rate_limit_window
+                )
             )
 
 
@@ -664,6 +1240,9 @@ class TTSClient:
         # Initialize retry handler
         self._retry_handler = RetryHandler(self.config.retry_config)
         
+        # Initialize rate limiting manager
+        self._rate_limit_manager = RateLimitManager(self.config.rate_limit_config)
+        
         # Thread safety
         self._lock = threading.RLock()
         
@@ -756,6 +1335,68 @@ class TTSClient:
         
         return self._retry_handler.execute_with_retry(_make_request)
     
+    def _make_rate_limited_request(self, method: str, url: str, priority: QueuePriority = QueuePriority.NORMAL, **kwargs) -> requests.Response:
+        """
+        Make a rate-limited HTTP request through the rate limiting system.
+        
+        Args:
+            method: HTTP method (GET, POST, etc.)
+            url: Request URL
+            priority: Request priority for queuing
+            **kwargs: Additional arguments for the request
+            
+        Returns:
+            requests.Response: The response object
+            
+        Raises:
+            RateLimitError: If request is rejected due to rate limiting
+            Exception: If request fails
+        """
+        if not self._rate_limit_manager.config.enabled:
+            # Rate limiting disabled, use retryable request directly
+            return self._make_retryable_request(method, url, **kwargs)
+        
+        # Create a response container to capture the result
+        response_container = {}
+        exception_container = {}
+        
+        def _execute_request():
+            """Execute the request and store result in container."""
+            try:
+                response = self._make_retryable_request(method, url, **kwargs)
+                response_container['response'] = response
+                
+                # Update rate limits from response headers
+                self._rate_limit_manager.update_from_response_headers(dict(response.headers))
+                
+            except Exception as e:
+                exception_container['exception'] = e
+        
+        # Submit request to rate limiting queue
+        if self._rate_limit_manager.submit_request(
+            _execute_request,
+            priority=priority,
+            timeout=kwargs.get('timeout', self.config.timeout)
+        ):
+            # Wait for request to be processed
+            # This is a simplified implementation - in practice, you'd want
+            # to implement proper async/await or callback mechanisms
+            import time
+            timeout = kwargs.get('timeout', self.config.timeout)
+            start_time = time.time()
+            
+            while time.time() - start_time < timeout:
+                if 'response' in response_container:
+                    return response_container['response']
+                elif 'exception' in exception_container:
+                    raise exception_container['exception']
+                
+                time.sleep(0.1)  # Small delay to avoid busy waiting
+            
+            raise RateLimitError("Request timed out waiting for rate limit processing")
+        else:
+            raise RateLimitError("Request rejected by rate limiter - queue may be full")
+    
     @property
     def is_initialized(self) -> bool:
         """Check if client is properly initialized."""
@@ -803,8 +1444,8 @@ class TTSClient:
         try:
             self.logger.info("Validating API key...")
             
-            # Use retryable request for API key validation
-            response = self._make_retryable_request(
+            # Use rate-limited request for API key validation
+            response = self._make_rate_limited_request(
                 "GET",
                 f"{self.config.base_url}/user",
                 timeout=self.config.timeout
@@ -938,10 +1579,11 @@ class TTSClient:
             try:
                 self.logger.info("Fetching available voices...")
                 
-                # Fetch voices from API with retry logic
-                response = self._make_retryable_request(
+                # Fetch voices from API with rate limiting
+                response = self._make_rate_limited_request(
                     "GET",
                     f"{self.config.base_url}/voices",
+                    priority=QueuePriority.LOW,
                     timeout=self.config.timeout
                 )
                 
@@ -1374,6 +2016,48 @@ class TTSClient:
             }
         }
     
+    def get_rate_limit_stats(self) -> Dict[str, Any]:
+        """
+        Get detailed rate limiting statistics and configuration.
+        
+        Returns:
+            Dict[str, Any]: Rate limiting statistics and configuration info
+            
+        Example:
+            >>> client = TTSClient(api_key="your-api-key")
+            >>> rate_stats = client.get_rate_limit_stats()
+            >>> print(f"Requests queued: {rate_stats['stats']['requests_queued']}")
+        """
+        if not self._rate_limit_manager:
+            return {
+                "status": "no_rate_limit_manager",
+                "rate_limiting_active": False
+            }
+        
+        return {
+            "status": "active",
+            "rate_limiting_active": self._rate_limit_manager.config.enabled,
+            "config": {
+                "enabled": self._rate_limit_manager.config.enabled,
+                "requests_per_second": self._rate_limit_manager.config.requests_per_second,
+                "burst_requests": self._rate_limit_manager.config.burst_requests,
+                "adaptive_enabled": self._rate_limit_manager.config.adaptive_enabled,
+                "respect_headers": self._rate_limit_manager.config.respect_headers,
+                "token_bucket": {
+                    "capacity": self._rate_limit_manager.config.token_bucket.capacity,
+                    "refill_rate": self._rate_limit_manager.config.token_bucket.refill_rate,
+                    "burst_capacity": self._rate_limit_manager.config.token_bucket.burst_capacity
+                },
+                "queue": {
+                    "max_size": self._rate_limit_manager.config.queue.max_size,
+                    "overflow_strategy": self._rate_limit_manager.config.queue.overflow_strategy.value,
+                    "priority_enabled": self._rate_limit_manager.config.queue.priority_enabled,
+                    "worker_threads": self._rate_limit_manager.config.queue.worker_threads
+                }
+            },
+            "stats": self._rate_limit_manager.get_stats()
+        }
+    
     def reset_retry_stats(self):
         """
         Reset retry statistics.
@@ -1385,6 +2069,24 @@ class TTSClient:
         if self._retry_handler:
             self._retry_handler.reset_stats()
             self.logger.info("Retry statistics reset")
+    
+    def reset_rate_limit_stats(self):
+        """
+        Reset rate limiting statistics.
+        
+        Example:
+            >>> client = TTSClient(api_key="your-api-key")
+            >>> client.reset_rate_limit_stats()
+        """
+        if self._rate_limit_manager:
+            self._rate_limit_manager.stats = {
+                "requests_processed": 0,
+                "requests_queued": 0,
+                "requests_rejected": 0,
+                "rate_limit_hits": 0,
+                "adaptive_adjustments": 0
+            }
+            self.logger.info("Rate limiting statistics reset")
     
     def health_check(self) -> Dict[str, Any]:
         """
@@ -1408,7 +2110,8 @@ class TTSClient:
                 "cache_size": len(self._voice_cache),
                 "config_valid": True,
                 "session_manager_active": self._session_manager is not None,
-                "retry_handler_active": self._retry_handler is not None
+                "retry_handler_active": self._retry_handler is not None,
+                "rate_limit_manager_active": self._rate_limit_manager is not None
             }
             
             # Check session manager health
@@ -1434,6 +2137,19 @@ class TTSClient:
                             health_info["status"] = "degraded"
                 except Exception:
                     health_info["retry_handler_stats"] = {"status": "error"}
+                    health_info["status"] = "degraded"
+            
+            # Check rate limiting health
+            if self._rate_limit_manager:
+                try:
+                    rate_stats = self._rate_limit_manager.get_stats()
+                    health_info["rate_limit_stats"] = rate_stats
+                    # Check if queue is getting too full
+                    queue_stats = rate_stats.get("queue", {})
+                    if queue_stats.get("utilization", 0) > 0.8:  # More than 80% full
+                        health_info["status"] = "degraded"
+                except Exception:
+                    health_info["rate_limit_stats"] = {"status": "error"}
                     health_info["status"] = "degraded"
             
             # Check API key

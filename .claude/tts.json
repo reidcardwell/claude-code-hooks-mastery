@@ -1,0 +1,34 @@
+{
+  "enabled": true,
+  "default_voice_id": "6HWqrqOzDfj3UnywjJoZ",
+  "word_count_threshold": 1,
+  "max_word_count": 100,
+  "excluded_tools": ["Read", "Grep", "LS", "TodoRead", "Glob"],
+  "enable_response_tts": true,
+  "response_tts": {
+    "min_word_count": 3,
+    "max_word_count": 150,
+    "response_delay": 1.0,
+    "filter_tool_responses": true,
+    "filter_code_blocks": true,
+    "filter_file_paths": true
+  },
+  "filter_settings": {
+    "bash": {
+      "speak_success": true,
+      "speak_errors": true
+    },
+    "git": {
+      "speak_success": true,
+      "speak_errors": true
+    },
+    "file_operation": {
+      "speak_write_operations": true,
+      "speak_read_operations": false
+    },
+    "search": {
+      "speak_search_results": false,
+      "speak_errors": true
+    }
+  }
+}

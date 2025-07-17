@@ -30,7 +30,7 @@ import asyncio
 import logging
 import requests
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union, Callable
+from typing import Any, Dict, List, Optional, Union, Callable, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 import threading

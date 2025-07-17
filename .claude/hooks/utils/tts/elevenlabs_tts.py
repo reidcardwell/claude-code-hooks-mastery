@@ -61,13 +61,24 @@ def main():
         print("🔊 Generating and playing...")
 
         try:
+            # Load voice configuration from Claude settings if available
+            default_voice_id = "6HWqrqOzDfj3UnywjJoZ"  # Britney default
+            try:
+                tts_config_path = Path.cwd() / '.claude' / 'tts.json'
+                if tts_config_path.exists():
+                    import json
+                    with open(tts_config_path, 'r') as f:
+                        tts_config = json.load(f)
+                        default_voice_id = tts_config.get('default_voice_id', default_voice_id)
+            except Exception:
+                pass  # Use default if settings can't be loaded
+            
+            print(f"🎤 Using voice ID: {default_voice_id}")
+            
             # Generate and play audio directly
-            David = "jvcMcno3QtjOzGtfpjoI"
-            Cornelius = "6sFKzaJr574YWVu4UuJF"
-            Britney = "6HWqrqOzDfj3UnywjJoZ"
             audio = elevenlabs.text_to_speech.convert(
                 text=text,
-                voice_id = Britney,
+                voice_id=default_voice_id,
                 model_id="eleven_turbo_v2_5",
                 output_format="mp3_44100_128",
             )

@@ -427,68 +427,161 @@ class AsyncTTSQueue(AsyncTTSInterface):
 
 class AsyncTTSWorker(AsyncTTSInterface):
     """
-    Background worker for processing TTS requests
+    Background worker for processing TTS requests with ThreadPoolExecutor infrastructure
     """
     
-    def __init__(self, worker_id: str, queue: AsyncTTSQueue, tts_client):
+    def __init__(self, worker_id: str, queue: AsyncTTSQueue, tts_client, max_thread_workers: int = 2):
         self.worker_id = worker_id
         self.queue = queue
         self.tts_client = tts_client
+        self.max_thread_workers = max_thread_workers
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._processed_count = 0
         self._error_count = 0
+        self._consecutive_errors = 0
+        self._last_error_time = 0.0
+        self._thread_pool: Optional[ThreadPoolExecutor] = None
+        self._thread_health_monitor: Optional[asyncio.Task] = None
+        self._restart_count = 0
+        self._last_restart_time = 0.0
+        self._thread_status: Dict[str, Dict[str, Any]] = {}
+        self._work_distribution_stats = {
+            "total_distributed": 0,
+            "pending_work": 0,
+            "active_threads": 0,
+            "thread_utilization": 0.0
+        }
         
     async def start(self) -> None:
-        """Start the worker"""
+        """Start the worker with thread pool infrastructure"""
+        if self._running:
+            return
+            
         self._running = True
+        
+        # Initialize thread pool
+        self._thread_pool = ThreadPoolExecutor(
+            max_workers=self.max_thread_workers,
+            thread_name_prefix=f"tts-worker-{self.worker_id}"
+        )
+        
+        # Start main worker loop
         self._task = asyncio.create_task(self._worker_loop())
-        logger.info(f"Worker {self.worker_id} started")
+        
+        # Start thread health monitoring
+        self._thread_health_monitor = asyncio.create_task(self._thread_health_monitor_loop())
+        
+        logger.info(f"Worker {self.worker_id} started with {self.max_thread_workers} thread workers")
     
     async def stop(self) -> None:
-        """Stop the worker"""
+        """Stop the worker with graceful thread shutdown"""
+        if not self._running:
+            return
+            
         self._running = False
+        
+        # Cancel health monitoring
+        if self._thread_health_monitor:
+            self._thread_health_monitor.cancel()
+            try:
+                await self._thread_health_monitor
+            except asyncio.CancelledError:
+                pass
+        
+        # Cancel main task
         if self._task:
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
-        logger.info(f"Worker {self.worker_id} stopped")
+        
+        # Shutdown thread pool
+        if self._thread_pool:
+            self._thread_pool.shutdown(wait=True, cancel_futures=True)
+            self._thread_pool = None
+        
+        logger.info(f"Worker {self.worker_id} stopped (restarts: {self._restart_count})")
     
     async def _worker_loop(self) -> None:
-        """Main worker processing loop"""
+        """Main worker processing loop with enhanced error handling"""
         while self._running:
             try:
+                # Check if we need to restart due to excessive errors
+                if self._consecutive_errors >= 5:
+                    await self._restart_worker()
+                    continue
+                
                 request = await self.queue.dequeue()
                 if request:
                     await self._process_request(request)
+                    self._consecutive_errors = 0  # Reset on success
+                else:
+                    await asyncio.sleep(0.1)  # Brief pause if no requests
+                    
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Worker {self.worker_id} error: {e}")
                 self._error_count += 1
-                await asyncio.sleep(1)  # Brief pause on error
+                self._consecutive_errors += 1
+                self._last_error_time = time.time()
+                await asyncio.sleep(min(2 ** self._consecutive_errors, 10))  # Exponential backoff
     
     async def _process_request(self, request: TTSRequest) -> None:
-        """Process a single TTS request"""
+        """Process a single TTS request with enhanced thread management"""
+        if not self._thread_pool:
+            raise RuntimeError("Thread pool not initialized")
+        
+        thread_id = None
+        
         try:
             request.status = TTSRequestStatus.PROCESSING
             
-            # Use thread pool for blocking TTS operation
+            # Update work distribution stats
+            self._work_distribution_stats["total_distributed"] += 1
+            self._work_distribution_stats["pending_work"] += 1
+            
+            # Submit to thread pool with timeout
             loop = asyncio.get_event_loop()
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                await loop.run_in_executor(
-                    executor,
-                    self._synthesize_tts,
-                    request
+            future = self._thread_pool.submit(self._synthesize_tts, request)
+            
+            # Track thread assignment
+            thread_id = id(future)
+            self._thread_status[str(thread_id)] = {
+                "request_id": request.request_id,
+                "start_time": time.time(),
+                "status": "running"
+            }
+            
+            # Wait for completion with timeout
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, future.result),
+                    timeout=30.0  # 30 second timeout
                 )
+            except asyncio.TimeoutError:
+                future.cancel()
+                raise TimeoutError(f"TTS request {request.request_id} timed out")
+            finally:
+                # Update thread status
+                if thread_id and str(thread_id) in self._thread_status:
+                    self._thread_status[str(thread_id)]["status"] = "completed"
+                    self._thread_status[str(thread_id)]["end_time"] = time.time()
+                
+                self._work_distribution_stats["pending_work"] -= 1
             
             await self.queue.complete_request(request.request_id, success=True)
             self._processed_count += 1
             
         except Exception as e:
             logger.error(f"Failed to process request {request.request_id}: {e}")
+            
+            # Update thread status on error
+            if thread_id and str(thread_id) in self._thread_status:
+                self._thread_status[str(thread_id)]["status"] = "failed"
+                self._thread_status[str(thread_id)]["error"] = str(e)
             
             if request.can_retry():
                 request.mark_retry()
@@ -497,29 +590,164 @@ class AsyncTTSWorker(AsyncTTSInterface):
                 await self.queue.complete_request(request.request_id, success=False)
             
             self._error_count += 1
+            self._consecutive_errors += 1
     
     def _synthesize_tts(self, request: TTSRequest) -> None:
-        """Synchronous TTS synthesis (runs in thread pool)"""
+        """Synchronous TTS synthesis with thread-safe execution"""
         try:
-            # Import here to avoid circular imports
-            from .elevenlabs_tts import speak_text
+            # Set thread name for monitoring
+            current_thread = threading.current_thread()
+            original_name = current_thread.name
+            current_thread.name = f"tts-{self.worker_id}-{request.request_id[:8]}"
             
-            voice_id = request.config.get('voice_id', '6HWqrqOzDfj3UnywjJoZ')
-            speak_text(request.text, voice_id)
+            try:
+                # Import here to avoid circular imports
+                from .elevenlabs_tts import speak_text
+                
+                voice_id = request.config.get('voice_id', '6HWqrqOzDfj3UnywjJoZ')
+                speak_text(request.text, voice_id)
+                
+            finally:
+                # Restore original thread name
+                current_thread.name = original_name
             
         except Exception as e:
             logger.error(f"TTS synthesis failed: {e}")
             raise
     
+    async def _thread_health_monitor_loop(self) -> None:
+        """Monitor thread health and performance"""
+        while self._running:
+            try:
+                await asyncio.sleep(5)  # Check every 5 seconds
+                await self._check_thread_health()
+                await self._update_work_distribution_stats()
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Thread health monitor error: {e}")
+                await asyncio.sleep(10)  # Wait longer on error
+    
+    async def _check_thread_health(self) -> None:
+        """Check thread pool health and identify issues"""
+        if not self._thread_pool:
+            return
+        
+        current_time = time.time()
+        
+        # Check for stuck threads
+        stuck_threads = []
+        for thread_id, status in self._thread_status.items():
+            if status["status"] == "running":
+                run_time = current_time - status["start_time"]
+                if run_time > 60:  # 1 minute threshold
+                    stuck_threads.append((thread_id, run_time))
+        
+        if stuck_threads:
+            logger.warning(f"Worker {self.worker_id} has {len(stuck_threads)} stuck threads")
+            
+            # If too many stuck threads, restart worker
+            if len(stuck_threads) >= self.max_thread_workers:
+                logger.error(f"Worker {self.worker_id} has all threads stuck, restarting...")
+                await self._restart_worker()
+        
+        # Cleanup old thread status entries
+        cutoff_time = current_time - 300  # 5 minutes
+        old_entries = [
+            tid for tid, status in self._thread_status.items()
+            if status.get("end_time", current_time) < cutoff_time
+        ]
+        
+        for tid in old_entries:
+            del self._thread_status[tid]
+    
+    async def _update_work_distribution_stats(self) -> None:
+        """Update work distribution statistics"""
+        if not self._thread_pool:
+            return
+        
+        # Calculate thread utilization
+        active_threads = sum(1 for status in self._thread_status.values() if status["status"] == "running")
+        self._work_distribution_stats["active_threads"] = active_threads
+        self._work_distribution_stats["thread_utilization"] = active_threads / self.max_thread_workers
+    
+    async def _restart_worker(self) -> None:
+        """Restart worker after failures"""
+        current_time = time.time()
+        
+        # Rate limit restarts
+        if current_time - self._last_restart_time < 60:  # 1 minute cooldown
+            logger.warning(f"Worker {self.worker_id} restart rate limited")
+            return
+        
+        logger.info(f"Restarting worker {self.worker_id} after {self._consecutive_errors} consecutive errors")
+        
+        # Shutdown current thread pool
+        if self._thread_pool:
+            self._thread_pool.shutdown(wait=False, cancel_futures=True)
+        
+        # Create new thread pool
+        self._thread_pool = ThreadPoolExecutor(
+            max_workers=self.max_thread_workers,
+            thread_name_prefix=f"tts-worker-{self.worker_id}-restart-{self._restart_count}"
+        )
+        
+        # Reset counters
+        self._consecutive_errors = 0
+        self._restart_count += 1
+        self._last_restart_time = current_time
+        self._thread_status.clear()
+        
+        logger.info(f"Worker {self.worker_id} restarted successfully")
+    
     async def health_check(self) -> Dict[str, Any]:
-        """Return worker health status"""
+        """Return comprehensive worker health status"""
+        current_time = time.time()
+        
+        # Thread pool status
+        thread_pool_status = {
+            "initialized": self._thread_pool is not None,
+            "max_workers": self.max_thread_workers,
+            "active_threads": self._work_distribution_stats["active_threads"],
+            "utilization": self._work_distribution_stats["thread_utilization"],
+            "pending_work": self._work_distribution_stats["pending_work"]
+        }
+        
+        # Error analysis
+        error_analysis = {
+            "total_errors": self._error_count,
+            "consecutive_errors": self._consecutive_errors,
+            "error_rate": self._error_count / max(self._processed_count, 1),
+            "last_error_age": current_time - self._last_error_time if self._last_error_time > 0 else None,
+            "restart_count": self._restart_count,
+            "last_restart_age": current_time - self._last_restart_time if self._last_restart_time > 0 else None
+        }
+        
+        # Thread health
+        thread_health = {
+            "total_threads": len(self._thread_status),
+            "running_threads": sum(1 for s in self._thread_status.values() if s["status"] == "running"),
+            "completed_threads": sum(1 for s in self._thread_status.values() if s["status"] == "completed"),
+            "failed_threads": sum(1 for s in self._thread_status.values() if s["status"] == "failed"),
+            "stuck_threads": sum(1 for s in self._thread_status.values() 
+                               if s["status"] == "running" and current_time - s["start_time"] > 60)
+        }
+        
         return {
             "worker_id": self.worker_id,
             "is_running": self._running,
             "processed_count": self._processed_count,
-            "error_count": self._error_count,
-            "error_rate": self._error_count / max(self._processed_count, 1),
-            "is_healthy": self._running and self._error_count < 10
+            "thread_pool_status": thread_pool_status,
+            "error_analysis": error_analysis,
+            "thread_health": thread_health,
+            "work_distribution_stats": self._work_distribution_stats.copy(),
+            "is_healthy": (
+                self._running and 
+                self._consecutive_errors < 3 and
+                thread_health["stuck_threads"] == 0 and
+                (self._thread_pool is not None)
+            )
         }
 
 
@@ -582,9 +810,14 @@ class AsyncTTSEngine:
         # Start queue
         await self.queue.start()
         
-        # Start workers
+        # Start workers with enhanced thread pool support
         for i in range(self.max_workers):
-            worker = AsyncTTSWorker(f"worker-{i}", self.queue, self.tts_client)
+            worker = AsyncTTSWorker(
+                f"worker-{i}", 
+                self.queue, 
+                self.tts_client,
+                max_thread_workers=2  # Each worker gets 2 threads
+            )
             await worker.start()
             self.workers.append(worker)
         
@@ -710,14 +943,41 @@ class AsyncTTSEngine:
             logger.error(f"Resource cleanup error: {e}")
     
     async def health_check(self) -> Dict[str, Any]:
-        """Return comprehensive health status"""
+        """Return comprehensive health status with thread pool metrics"""
         queue_health = await self.queue.health_check()
         
         worker_health = []
+        total_threads = 0
+        active_threads = 0
+        total_restarts = 0
+        
         for worker in self.workers:
-            worker_health.append(await worker.health_check())
+            health = await worker.health_check()
+            worker_health.append(health)
+            
+            # Aggregate thread pool metrics
+            if "thread_pool_status" in health:
+                thread_status = health["thread_pool_status"]
+                total_threads += thread_status.get("max_workers", 0)
+                active_threads += thread_status.get("active_threads", 0)
+            
+            # Aggregate restart counts
+            if "error_analysis" in health:
+                total_restarts += health["error_analysis"].get("restart_count", 0)
         
         process = psutil.Process()
+        
+        # Thread pool summary
+        thread_pool_summary = {
+            "total_thread_capacity": total_threads,
+            "active_threads": active_threads,
+            "thread_utilization": active_threads / max(total_threads, 1),
+            "total_worker_restarts": total_restarts,
+            "thread_pool_efficiency": sum(
+                w.get("thread_pool_status", {}).get("utilization", 0) 
+                for w in worker_health
+            ) / max(len(worker_health), 1)
+        }
         
         return {
             "engine_running": self._running,
@@ -725,12 +985,14 @@ class AsyncTTSEngine:
             "worker_health": worker_health,
             "healthy_workers": sum(1 for w in worker_health if w["is_healthy"]),
             "total_workers": len(self.workers),
+            "thread_pool_summary": thread_pool_summary,
             "memory_usage_mb": process.memory_info().rss / 1024 / 1024,
             "cpu_percent": process.cpu_percent(),
             "is_healthy": (
                 self._running and 
                 queue_health["is_healthy"] and 
-                sum(1 for w in worker_health if w["is_healthy"]) >= len(self.workers) // 2
+                sum(1 for w in worker_health if w["is_healthy"]) >= len(self.workers) // 2 and
+                thread_pool_summary["thread_utilization"] < 0.9  # Not overloaded
             )
         }
 
@@ -843,29 +1105,54 @@ async def speak_with_retry(text: str, config: Dict[str, Any],
 
 # Testing utilities
 async def test_async_engine():
-    """Test the async TTS engine"""
-    print("Testing AsyncTTSEngine...")
+    """Test the async TTS engine with thread pool infrastructure"""
+    print("Testing AsyncTTSEngine with Thread Pool Infrastructure...")
     
     async with async_tts_context() as engine:
         # Test basic functionality
         request_id = await engine.speak_async("Hello, world!", {"voice_id": "6HWqrqOzDfj3UnywjJoZ"})
         print(f"Queued request: {request_id}")
         
-        # Test health check
+        # Test initial health check
         health = await engine.health_check()
-        print(f"Health status: {health}")
+        print(f"Initial health status:")
+        print(f"  - Engine running: {health['engine_running']}")
+        print(f"  - Workers: {health['healthy_workers']}/{health['total_workers']}")
+        print(f"  - Thread pool: {health['thread_pool_summary']['active_threads']}/{health['thread_pool_summary']['total_thread_capacity']}")
+        print(f"  - Thread utilization: {health['thread_pool_summary']['thread_utilization']:.2%}")
         
-        # Test batch processing
-        texts = ["First message", "Second message", "Third message"]
+        # Test batch processing to stress thread pool
+        texts = [
+            "First message",
+            "Second message", 
+            "Third message",
+            "Fourth message",
+            "Fifth message"
+        ]
         request_ids = await batch_speak_async(texts, {"voice_id": "6HWqrqOzDfj3UnywjJoZ"}, engine)
-        print(f"Batch requests: {request_ids}")
+        print(f"Batch requests queued: {len(request_ids)}")
         
-        # Wait a bit for processing
-        await asyncio.sleep(2)
+        # Monitor thread pool during processing
+        for i in range(3):
+            await asyncio.sleep(1)
+            health = await engine.health_check()
+            print(f"Processing... Active threads: {health['thread_pool_summary']['active_threads']}")
         
-        # Final health check
+        # Final comprehensive health check
         final_health = await engine.health_check()
-        print(f"Final health: {final_health}")
+        print(f"\nFinal health status:")
+        print(f"  - Engine healthy: {final_health['is_healthy']}")
+        print(f"  - Queue size: {final_health['queue_health']['queue_size']}")
+        print(f"  - Total restarts: {final_health['thread_pool_summary']['total_worker_restarts']}")
+        print(f"  - Thread pool efficiency: {final_health['thread_pool_summary']['thread_pool_efficiency']:.2%}")
+        
+        # Test worker health details
+        for i, worker in enumerate(final_health['worker_health']):
+            print(f"  - Worker {i}:")
+            print(f"    - Processed: {worker['processed_count']}")
+            print(f"    - Errors: {worker['error_analysis']['total_errors']}")
+            print(f"    - Thread utilization: {worker['thread_pool_status']['utilization']:.2%}")
+            print(f"    - Healthy: {worker['is_healthy']}")
     
     print("Test completed!")
 

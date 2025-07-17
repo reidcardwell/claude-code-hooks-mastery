@@ -487,6 +487,36 @@ class BashFilter(ToolFilter):
         Returns:
             Optional[str]: Success message for TTS, or None for default processing
         """
+        # First check if we have meaningful output that meets word count threshold
+        from .text_processor import word_count, strip_ansi_codes
+        
+        # Extract the actual command output
+        stdout = parsed_data.get("stdout", "")
+        stderr = parsed_data.get("stderr", "")
+        output = stdout or stderr
+        
+        if output:
+            clean_output = strip_ansi_codes(output.strip())
+            output_word_count = word_count(clean_output)
+            
+            # If output meets word count threshold, return None to use original output
+            # Load TTS config to check threshold
+            try:
+                import sys
+                import os
+                hooks_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+                sys.path.insert(0, hooks_dir)
+                from post_tool_use import load_tts_config
+                tts_config = load_tts_config()
+                min_words = tts_config.get('word_count_threshold', 1)
+                max_words = tts_config.get('max_word_count', 200)
+                
+                if min_words <= output_word_count <= max_words:
+                    return None  # Use original output for TTS
+            except Exception as e:
+                # If config loading fails, continue with generic message
+                pass
+        
         # Get command for context
         command = self._extract_command(parsed_data)
         
@@ -1975,16 +2005,22 @@ class ToolFilterRegistry:
         """
         Load configuration from settings file.
         
-        Expected configuration format:
+        Expected configuration format (new .claude/tts.json format):
+        {
+            "excluded_tools": ["Read", "Grep", "LS", "TodoRead"],
+            "filter_settings": {
+                "bash": {"speak_success": true, "speak_errors": true},
+                "git": {"speak_success": true, "speak_errors": true},
+                "file_operation": {"speak_write_operations": true, "speak_read_operations": false},
+                "search": {"speak_search_results": false, "speak_errors": true}
+            }
+        }
+        
+        Or legacy format (old .claude/settings.json format):
         {
             "tts_settings": {
                 "excluded_tools": ["Read", "Grep", "LS", "TodoRead"],
-                "filter_settings": {
-                    "bash": {"speak_success": true, "speak_errors": true},
-                    "git": {"speak_success": true, "speak_errors": true},
-                    "file_operation": {"speak_write_operations": true, "speak_read_operations": false},
-                    "search": {"speak_search_results": false, "speak_errors": true}
-                }
+                "filter_settings": { ... }
             }
         }
         """
@@ -1999,8 +2035,14 @@ class ToolFilterRegistry:
                 with open(self.settings_path, 'r') as f:
                     settings = json.load(f)
                 
-                # Extract TTS configuration
-                tts_settings = settings.get('tts_settings', {})
+                # Extract TTS configuration - check for tts_settings or use entire file
+                if 'tts_settings' in settings:
+                    # Old format: tts_settings is a section in settings.json
+                    tts_settings = settings['tts_settings']
+                else:
+                    # New format: entire file is TTS configuration (tts.json)
+                    tts_settings = settings
+                
                 self.configuration = tts_settings
                 
                 # Update excluded tools if configured
@@ -3520,6 +3562,7 @@ if __name__ == "__main__":
     import json
     import os
     
+    # Test legacy format (old .claude/settings.json format)
     mock_settings = {
         "tts_settings": {
             "excluded_tools": ["Read", "Grep", "MockTool"],
@@ -3527,6 +3570,15 @@ if __name__ == "__main__":
                 "bash": {"speak_success": False, "speak_errors": True},
                 "search": {"speak_search_results": True, "speak_errors": False}
             }
+        }
+    }
+    
+    # Test new format (new .claude/tts.json format)
+    mock_tts_config = {
+        "excluded_tools": ["Read", "Grep", "MockTool"],
+        "filter_settings": {
+            "bash": {"speak_success": False, "speak_errors": True},
+            "search": {"speak_search_results": True, "speak_errors": False}
         }
     }
     

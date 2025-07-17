@@ -615,6 +615,291 @@ class TTSConfig:
         # Save to settings.json
         return self.save_to_settings(settings_path)
     
+    # Default merging and backward compatibility methods
+    
+    def merge_with_defaults(self, user_config: Dict[str, Any], 
+                           apply_compatibility: bool = True) -> 'TTSConfig':
+        """
+        Merge user configuration with default values, handling missing properties
+        and backward compatibility.
+        
+        Args:
+            user_config: User's configuration dictionary
+            apply_compatibility: Whether to apply backward compatibility transformations
+            
+        Returns:
+            TTSConfig: New configuration instance with merged settings
+        """
+        # Start with current instance as base (containing defaults)
+        merged_config = self.copy()
+        
+        # Apply compatibility transformations if requested
+        if apply_compatibility:
+            user_config = self._apply_compatibility_layer(user_config)
+        else:
+            # Make a copy to avoid modifying the original
+            user_config = user_config.copy()
+        
+        # Merge user settings, preserving user values while filling gaps with defaults
+        for field_name, field_value in user_config.items():
+            if hasattr(merged_config, field_name):
+                # Special handling for nested dictionaries (like filter_settings)
+                if field_name == 'filter_settings' and isinstance(field_value, dict):
+                    merged_filter_settings = {}
+                    
+                    # Start with existing defaults
+                    for tool_name, tool_settings in merged_config.filter_settings.items():
+                        merged_filter_settings[tool_name] = tool_settings.copy()
+                    
+                    # Merge each tool's settings from user config
+                    for tool_name, tool_settings in field_value.items():
+                        if tool_name in merged_filter_settings:
+                            # Merge tool-specific settings
+                            merged_filter_settings[tool_name].update(tool_settings)
+                        else:
+                            # Add new tool settings
+                            merged_filter_settings[tool_name] = tool_settings.copy()
+                    
+                    merged_config.filter_settings = merged_filter_settings
+                elif field_name == 'skip_tools' and isinstance(field_value, list):
+                    # Preserve user's skip_tools list
+                    merged_config.skip_tools = field_value.copy()
+                else:
+                    # Direct assignment for other fields
+                    setattr(merged_config, field_name, field_value)
+        
+        # Re-run validation after merging
+        merged_config.__post_init__()
+        
+        return merged_config
+    
+    def _apply_compatibility_layer(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Apply backward compatibility transformations to configuration.
+        
+        Args:
+            config: Original configuration dictionary
+            
+        Returns:
+            Dict[str, Any]: Configuration with compatibility transformations applied
+        """
+        # Create a copy to avoid modifying original
+        compat_config = config.copy()
+        
+        # Detect and handle deprecated property names
+        deprecated_mappings = {
+            'wordLimit': 'max_words',
+            'voiceId': 'voice_id',
+            'skipTools': 'skip_tools',
+            'speakConfirmations': 'speak_confirmations',
+            'wordCountThreshold': 'word_count_threshold',
+            'maxWordCount': 'max_word_count',
+            'enableResponseTts': 'enable_response_tts',
+            'responseTtsMinWords': 'response_tts_min_words',
+            'responseTtsMaxWords': 'response_tts_max_words',
+            'responseDelay': 'response_delay',
+            'filterToolResponses': 'filter_tool_responses',
+            'filterCodeBlocks': 'filter_code_blocks',
+            'filterFilePaths': 'filter_file_paths',
+            'filterSettings': 'filter_settings'
+        }
+        
+        # Apply deprecated property mappings
+        for old_name, new_name in deprecated_mappings.items():
+            if old_name in compat_config:
+                compat_config[new_name] = compat_config.pop(old_name)
+        
+        # Handle version-specific compatibility
+        config_version = compat_config.get('version', '1.0')
+        
+        if config_version == '1.0':
+            # Version 1.0 compatibility: Convert boolean skip_tools to list
+            if 'skip_tools' in compat_config:
+                skip_tools = compat_config['skip_tools']
+                if isinstance(skip_tools, bool):
+                    # Convert boolean to default list or empty list
+                    compat_config['skip_tools'] = [
+                        "Read", "Grep", "LS", "TodoRead", "Glob", "git", "Bash"
+                    ] if skip_tools else []
+                elif isinstance(skip_tools, str):
+                    # Convert single string to list
+                    compat_config['skip_tools'] = [skip_tools]
+        
+        if config_version in ['1.0', '1.1']:
+            # Version 1.1 compatibility: Handle old filter settings format
+            if 'filter_settings' in compat_config:
+                old_filter = compat_config['filter_settings']
+                if isinstance(old_filter, dict):
+                    # Convert old flat format to new nested format
+                    new_filter = {}
+                    for key, value in old_filter.items():
+                        if key.startswith('bash_'):
+                            tool_name = 'bash'
+                            setting_name = key[5:]  # Remove 'bash_' prefix
+                        elif key.startswith('git_'):
+                            tool_name = 'git'
+                            setting_name = key[4:]  # Remove 'git_' prefix
+                        elif key.startswith('file_'):
+                            tool_name = 'file_operation'
+                            setting_name = key[5:]  # Remove 'file_' prefix
+                        elif key.startswith('search_'):
+                            tool_name = 'search'
+                            setting_name = key[7:]  # Remove 'search_' prefix
+                        else:
+                            continue
+                        
+                        if tool_name not in new_filter:
+                            new_filter[tool_name] = {}
+                        new_filter[tool_name][setting_name] = value
+                    
+                    compat_config['filter_settings'] = new_filter
+        
+        # Remove version field from config (not part of TTSConfig)
+        compat_config.pop('version', None)
+        
+        return compat_config
+    
+    @classmethod
+    def load_with_defaults(cls, settings_path: Optional[str] = None) -> 'TTSConfig':
+        """
+        Load configuration from settings.json with full default merging and compatibility.
+        
+        Args:
+            settings_path: Optional path to settings.json file
+            
+        Returns:
+            TTSConfig: Configuration instance with merged defaults and compatibility applied
+        """
+        if settings_path is None:
+            settings_path = Path.cwd() / '.claude' / 'settings.json'
+        else:
+            settings_path = Path(settings_path)
+        
+        # Start with default configuration
+        default_config = cls()
+        
+        # Check if settings file exists
+        if not settings_path.exists():
+            return default_config
+        
+        try:
+            # Read settings file with file locking
+            with open(settings_path, 'r', encoding='utf-8') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    settings_data = json.load(f)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            
+            # Extract TTS configuration section
+            tts_config = settings_data.get('tts', {})
+            
+            # Merge with defaults using compatibility layer
+            if tts_config:
+                return default_config.merge_with_defaults(tts_config, apply_compatibility=True)
+            else:
+                return default_config
+                
+        except (json.JSONDecodeError, IOError, OSError) as e:
+            # Return default configuration if file is corrupted or unreadable
+            return default_config
+    
+    def upgrade_config_format(self, config_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Upgrade configuration from older format to current format.
+        
+        Args:
+            config_dict: Configuration in older format
+            
+        Returns:
+            Dict[str, Any]: Configuration in current format
+        """
+        # Apply compatibility layer to upgrade format
+        upgraded_config = self._apply_compatibility_layer(config_dict)
+        
+        # Add current version marker
+        upgraded_config['version'] = '2.0'
+        
+        return upgraded_config
+    
+    def get_compatibility_info(self, config_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Get information about compatibility issues and upgrades needed.
+        
+        Args:
+            config_dict: Configuration dictionary to analyze
+            
+        Returns:
+            Dict[str, Any]: Information about compatibility status and needed upgrades
+        """
+        info = {
+            'version': config_dict.get('version', '1.0'),
+            'deprecated_properties': [],
+            'format_changes': [],
+            'upgrade_needed': False
+        }
+        
+        # Check for deprecated property names
+        deprecated_mappings = {
+            'wordLimit': 'max_words',
+            'voiceId': 'voice_id',
+            'skipTools': 'skip_tools',
+            'speakConfirmations': 'speak_confirmations',
+            'wordCountThreshold': 'word_count_threshold',
+            'maxWordCount': 'max_word_count',
+            'enableResponseTts': 'enable_response_tts',
+            'responseTtsMinWords': 'response_tts_min_words',
+            'responseTtsMaxWords': 'response_tts_max_words',
+            'responseDelay': 'response_delay',
+            'filterToolResponses': 'filter_tool_responses',
+            'filterCodeBlocks': 'filter_code_blocks',
+            'filterFilePaths': 'filter_file_paths',
+            'filterSettings': 'filter_settings'
+        }
+        
+        for old_name, new_name in deprecated_mappings.items():
+            if old_name in config_dict:
+                info['deprecated_properties'].append({
+                    'old_name': old_name,
+                    'new_name': new_name,
+                    'value': config_dict[old_name]
+                })
+                info['upgrade_needed'] = True
+        
+        # Check for format changes
+        version = info['version']
+        if version == '1.0':
+            if 'skip_tools' in config_dict or 'skipTools' in config_dict:
+                skip_tools = config_dict.get('skip_tools', config_dict.get('skipTools'))
+                if isinstance(skip_tools, bool):
+                    info['format_changes'].append({
+                        'property': 'skip_tools',
+                        'old_format': 'boolean',
+                        'new_format': 'list of strings',
+                        'description': 'skip_tools changed from boolean to list of tool names'
+                    })
+                    info['upgrade_needed'] = True
+        
+        if version in ['1.0', '1.1']:
+            if 'filter_settings' in config_dict or 'filterSettings' in config_dict:
+                filter_settings = config_dict.get('filter_settings', config_dict.get('filterSettings'))
+                if isinstance(filter_settings, dict):
+                    # Check if it uses old flat format
+                    has_old_format = any(
+                        key.startswith(('bash_', 'git_', 'file_', 'search_'))
+                        for key in filter_settings.keys()
+                    )
+                    if has_old_format:
+                        info['format_changes'].append({
+                            'property': 'filter_settings',
+                            'old_format': 'flat key-value pairs',
+                            'new_format': 'nested tool-specific settings',
+                            'description': 'filter_settings changed to nested structure'
+                        })
+                        info['upgrade_needed'] = True
+        
+        return info
+    
     # Hot-reload functionality
     
     def __init_hot_reload(self):

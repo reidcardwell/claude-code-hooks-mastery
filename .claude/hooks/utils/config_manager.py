@@ -12,7 +12,11 @@ import json
 import os
 import fcntl
 import time
+import threading
 from pathlib import Path
+from typing import Callable
+from dataclasses import dataclass
+from threading import Lock, Event
 
 
 @dataclass
@@ -610,6 +614,234 @@ class TTSConfig:
         
         # Save to settings.json
         return self.save_to_settings(settings_path)
+    
+    # Hot-reload functionality
+    
+    def __init_hot_reload(self):
+        """Initialize hot-reload infrastructure if not already initialized."""
+        if not hasattr(self, '_hot_reload_active'):
+            self._hot_reload_active = False
+            self._hot_reload_thread = None
+            self._hot_reload_stop_event = Event()
+            self._hot_reload_lock = Lock()
+            self._hot_reload_callbacks = []
+            self._hot_reload_last_modified = 0
+            self._hot_reload_debounce_time = 0.5  # 500ms debounce
+            self._hot_reload_settings_path = None
+    
+    def start_hot_reload(self, settings_path: Optional[str] = None, 
+                        debounce_time: float = 0.5) -> bool:
+        """
+        Start hot-reload monitoring for settings.json file changes.
+        
+        Args:
+            settings_path: Optional path to settings.json file
+            debounce_time: Time in seconds to debounce file changes
+            
+        Returns:
+            bool: True if hot-reload started successfully, False otherwise
+        """
+        self.__init_hot_reload()
+        
+        if settings_path is None:
+            settings_path = str(Path.cwd() / '.claude' / 'settings.json')
+        
+        with self._hot_reload_lock:
+            if self._hot_reload_active:
+                return False  # Already active
+            
+            self._hot_reload_settings_path = settings_path
+            self._hot_reload_debounce_time = debounce_time
+            self._hot_reload_stop_event.clear()
+            
+            # Start monitoring thread
+            self._hot_reload_thread = threading.Thread(
+                target=self._hot_reload_monitor,
+                daemon=True
+            )
+            self._hot_reload_thread.start()
+            self._hot_reload_active = True
+            
+            return True
+    
+    def stop_hot_reload(self) -> bool:
+        """
+        Stop hot-reload monitoring.
+        
+        Returns:
+            bool: True if hot-reload stopped successfully, False otherwise
+        """
+        if not hasattr(self, '_hot_reload_active') or not self._hot_reload_active:
+            return False
+        
+        with self._hot_reload_lock:
+            if not self._hot_reload_active:
+                return False
+            
+            # Signal stop
+            self._hot_reload_stop_event.set()
+            self._hot_reload_active = False
+            
+            # Wait for thread to finish
+            if self._hot_reload_thread and self._hot_reload_thread.is_alive():
+                self._hot_reload_thread.join(timeout=2.0)
+            
+            return True
+    
+    def add_reload_callback(self, callback: Callable[['TTSConfig'], None]) -> bool:
+        """
+        Add a callback to be called when configuration is reloaded.
+        
+        Args:
+            callback: Function to call with new configuration
+            
+        Returns:
+            bool: True if callback was added successfully
+        """
+        self.__init_hot_reload()
+        
+        if not callable(callback):
+            return False
+        
+        with self._hot_reload_lock:
+            if callback not in self._hot_reload_callbacks:
+                self._hot_reload_callbacks.append(callback)
+                return True
+            return False
+    
+    def remove_reload_callback(self, callback: Callable[['TTSConfig'], None]) -> bool:
+        """
+        Remove a reload callback.
+        
+        Args:
+            callback: Function to remove
+            
+        Returns:
+            bool: True if callback was removed successfully
+        """
+        if not hasattr(self, '_hot_reload_callbacks'):
+            return False
+        
+        with self._hot_reload_lock:
+            if callback in self._hot_reload_callbacks:
+                self._hot_reload_callbacks.remove(callback)
+                return True
+            return False
+    
+    def reload_config(self, settings_path: Optional[str] = None) -> bool:
+        """
+        Manually reload configuration from settings.json file.
+        
+        Args:
+            settings_path: Optional path to settings.json file
+            
+        Returns:
+            bool: True if reload was successful, False otherwise
+        """
+        try:
+            # Load new configuration
+            new_config = self.load_from_settings(settings_path)
+            
+            # Validate new configuration
+            if not new_config.is_valid():
+                return False
+            
+            # Apply new configuration to current instance
+            with self._hot_reload_lock if hasattr(self, '_hot_reload_lock') else threading.Lock():
+                # Update all fields
+                for field_name, field_value in new_config.to_dict().items():
+                    if hasattr(self, field_name):
+                        setattr(self, field_name, field_value)
+                
+                # Re-run validation
+                self.__post_init__()
+                
+                # Notify callbacks
+                if hasattr(self, '_hot_reload_callbacks'):
+                    for callback in self._hot_reload_callbacks:
+                        try:
+                            callback(self)
+                        except Exception:
+                            # Ignore callback errors to prevent reload failure
+                            pass
+            
+            return True
+            
+        except Exception:
+            return False
+    
+    def _hot_reload_monitor(self):
+        """Internal method to monitor settings file for changes."""
+        settings_path = Path(self._hot_reload_settings_path)
+        
+        # Get initial modification time
+        if settings_path.exists():
+            self._hot_reload_last_modified = settings_path.stat().st_mtime
+        
+        while not self._hot_reload_stop_event.is_set():
+            try:
+                # Check if file exists and get modification time
+                if settings_path.exists():
+                    current_modified = settings_path.stat().st_mtime
+                    
+                    # Check if file was modified
+                    if current_modified > self._hot_reload_last_modified:
+                        # Wait for debounce period
+                        if self._hot_reload_stop_event.wait(self._hot_reload_debounce_time):
+                            break  # Stop event was set during debounce
+                        
+                        # Check if file was modified again during debounce
+                        if settings_path.exists():
+                            final_modified = settings_path.stat().st_mtime
+                            if final_modified == current_modified:
+                                # File is stable, reload configuration
+                                self.reload_config(str(settings_path))
+                                self._hot_reload_last_modified = final_modified
+                            else:
+                                # File changed during debounce, will check again in next loop
+                                pass
+                
+                # Wait before next check (poll every 100ms)
+                if self._hot_reload_stop_event.wait(0.1):
+                    break
+                    
+            except (OSError, IOError):
+                # Handle file access errors gracefully
+                if self._hot_reload_stop_event.wait(1.0):
+                    break
+    
+    def is_hot_reload_active(self) -> bool:
+        """
+        Check if hot-reload is currently active.
+        
+        Returns:
+            bool: True if hot-reload is active, False otherwise
+        """
+        return hasattr(self, '_hot_reload_active') and self._hot_reload_active
+    
+    def get_hot_reload_status(self) -> Dict[str, Any]:
+        """
+        Get detailed hot-reload status information.
+        
+        Returns:
+            Dict[str, Any]: Status information including active state, settings path, etc.
+        """
+        if not hasattr(self, '_hot_reload_active'):
+            return {
+                'active': False,
+                'settings_path': None,
+                'debounce_time': 0,
+                'callback_count': 0,
+                'last_modified': 0
+            }
+        
+        return {
+            'active': self._hot_reload_active,
+            'settings_path': self._hot_reload_settings_path,
+            'debounce_time': self._hot_reload_debounce_time,
+            'callback_count': len(self._hot_reload_callbacks),
+            'last_modified': self._hot_reload_last_modified
+        }
 
 
 # Default configuration instance

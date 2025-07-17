@@ -157,7 +157,7 @@ def load_tts_config():
 
 def should_process_tool_for_tts(tool_name, tool_input, tool_response, tts_config):
     """
-    Determine if a tool use should trigger TTS processing.
+    Determine if a tool use should trigger TTS processing with enhanced filtering.
     
     Args:
         tool_name: Name of the tool that was used
@@ -174,15 +174,15 @@ def should_process_tool_for_tts(tool_name, tool_input, tool_response, tts_config
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
         f.write(f"{timestamp}: Checking TTS for tool '{tool_name}'\n")
     
-    # Check if tool is excluded
+    # First check: Excluded tools in configuration
     excluded_tools = tts_config.get('excluded_tools', [])
     if tool_name in excluded_tools:
         with open(debug_log_path, 'a') as f:
             timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-            f.write(f"{timestamp}: Tool '{tool_name}' is excluded\n")
+            f.write(f"{timestamp}: Tool '{tool_name}' is excluded by configuration\n")
         return False
     
-    # Get tool filter registry if available
+    # Second check: Tool-specific filtering via registry
     if TTS_AVAILABLE:
         try:
             # Initialize registry with TTS configuration path
@@ -190,39 +190,65 @@ def should_process_tool_for_tts(tool_name, tool_input, tool_response, tts_config
             initialize_global_registry(tts_config_path)
             
             registry = get_global_registry()
-            result = registry.should_speak(tool_name, tool_response)
-            with open(debug_log_path, 'a') as f:
-                timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-                f.write(f"{timestamp}: Registry result for '{tool_name}': {result}\n")
-            return result
+            
+            # Get tool-specific filter
+            tool_filter = registry.get_filter(tool_name)
+            if tool_filter:
+                # Use tool-specific should_speak logic
+                result = tool_filter.should_speak(tool_name, tool_response)
+                with open(debug_log_path, 'a') as f:
+                    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                    f.write(f"{timestamp}: Tool filter result for '{tool_name}': {result}\n")
+                return result
+            else:
+                # No specific filter found, use registry fallback
+                result = registry.should_speak(tool_name, tool_response)
+                with open(debug_log_path, 'a') as f:
+                    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                    f.write(f"{timestamp}: Registry fallback result for '{tool_name}': {result}\n")
+                return result
+            
         except Exception as e:
-            # Fallback to basic filtering if registry fails
+            # Log filter error but continue with fallback
             with open(debug_log_path, 'a') as f:
                 timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-                f.write(f"{timestamp}: Registry failed for '{tool_name}': {str(e)}\n")
-            pass
+                f.write(f"{timestamp}: Filter registry error for '{tool_name}': {str(e)}\n")
     
-    # Basic fallback logic
+    # Third check: Basic fallback logic for when filters unavailable
     # Skip tools that typically produce verbose output
     verbose_tools = {'Read', 'Grep', 'LS', 'TodoRead', 'Glob'}
     if tool_name in verbose_tools:
+        with open(debug_log_path, 'a') as f:
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+            f.write(f"{timestamp}: Tool '{tool_name}' is verbose, skipping\n")
         return False
     
     # Process tools that indicate completion or success
-    completion_tools = {'Edit', 'Write', 'Bash', 'MultiEdit'}
+    completion_tools = {'Edit', 'Write', 'Bash', 'MultiEdit', 'TodoWrite'}
     if tool_name in completion_tools:
         # Check if the operation was successful
         if hasattr(tool_response, 'get'):
             # For structured responses, check for error indicators
             if tool_response.get('error') or tool_response.get('stderr'):
+                with open(debug_log_path, 'a') as f:
+                    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                    f.write(f"{timestamp}: Tool '{tool_name}' had errors, skipping\n")
                 return False
+        
+        with open(debug_log_path, 'a') as f:
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+            f.write(f"{timestamp}: Tool '{tool_name}' is completion tool, processing\n")
         return True
     
-    return False
+    # Default: Allow processing for unknown tools
+    with open(debug_log_path, 'a') as f:
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        f.write(f"{timestamp}: Tool '{tool_name}' using default allow\n")
+    return True
 
 def extract_tts_text(tool_name, tool_input, tool_response, tts_config):
     """
-    Extract appropriate text for TTS from tool usage data.
+    Extract appropriate text for TTS from tool usage data with enhanced filtering.
     
     Args:
         tool_name: Name of the tool that was used
@@ -243,20 +269,51 @@ def extract_tts_text(tool_name, tool_input, tool_response, tts_config):
         # Strip ANSI codes and clean up text
         clean_text = strip_ansi_codes(response_text)
         
-        # Check word count constraints
+        # First check: Word count verification
         word_count_val = word_count(clean_text)
-        min_words = tts_config.get('word_count_threshold', 10)
+        min_words = tts_config.get('word_count_threshold', 1)
         max_words = tts_config.get('max_word_count', 200)
         
         if word_count_val < min_words or word_count_val > max_words:
             return ""
         
-        # Generate contextual message based on tool and success
+        # Second check: Tool-specific filtering using filter registry
+        if TTS_AVAILABLE:
+            try:
+                # Get tool filter registry
+                tts_config_path = str(Path.cwd() / '.claude' / 'tts.json')
+                initialize_global_registry(tts_config_path)
+                registry = get_global_registry()
+                
+                # Get tool-specific filter
+                tool_filter = registry.get_filter(tool_name)
+                if tool_filter:
+                    # Apply tool-specific should_speak logic
+                    if not tool_filter.should_speak(tool_name, tool_response):
+                        return ""
+                    
+                    # Generate tool-specific custom message
+                    custom_message = tool_filter.get_custom_message(tool_name, tool_response)
+                    if custom_message:
+                        return custom_message
+                
+            except Exception as e:
+                # Log filter error but continue with fallback
+                debug_log_path = Path.cwd() / 'logs' / 'tts_debug.log'
+                with open(debug_log_path, 'a') as f:
+                    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                    f.write(f"{timestamp}: Filter error for '{tool_name}': {str(e)}\n")
+        
+        # Fallback: Generate contextual message based on tool and success
         return generate_contextual_message(tool_name, tool_input, tool_response, clean_text)
         
-    except Exception:
-        # Fallback to simple success message
-        return f"Task completed successfully."
+    except Exception as e:
+        # Log extraction error and fallback to simple success message
+        debug_log_path = Path.cwd() / 'logs' / 'tts_debug.log'
+        with open(debug_log_path, 'a') as f:
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+            f.write(f"{timestamp}: Text extraction error for '{tool_name}': {str(e)}\n")
+        return "Task completed successfully."
 
 def generate_contextual_message(tool_name, tool_input, tool_response, extracted_text):
     """

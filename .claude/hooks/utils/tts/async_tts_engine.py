@@ -41,16 +41,19 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union, Callable, Awaitable
+from typing import Any, Dict, List, Optional, Union, Callable, Awaitable, Set
 from pathlib import Path
 import signal
 import threading
 import heapq
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 import gc
 import psutil
 import os
+import traceback
+import resource
+import sys
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -63,6 +66,9 @@ DEFAULT_WORKER_THREADS = 2
 DEFAULT_PRIORITY_BOOST_THRESHOLD = 2.0  # seconds
 DEFAULT_CLEANUP_INTERVAL = 30.0  # seconds
 DEFAULT_SHUTDOWN_TIMEOUT = 10.0  # seconds
+DEFAULT_MEMORY_THRESHOLD = 512 * 1024 * 1024  # 512MB
+DEFAULT_RESOURCE_LEAK_CHECK_INTERVAL = 60.0  # seconds
+DEFAULT_STALE_REQUEST_AGE = 300.0  # 5 minutes
 
 
 class TTSPriority(Enum):
@@ -176,6 +182,264 @@ class TTSRequest:
         """Mark request for retry"""
         self.retry_count += 1
         self.status = TTSRequestStatus.PENDING
+
+
+class TTSResourceType(Enum):
+    """Types of TTS resources for cleanup tracking"""
+    AUDIO_STREAM = "audio_stream"
+    API_CONNECTION = "api_connection"
+    THREAD_POOL = "thread_pool"
+    MEMORY_BUFFER = "memory_buffer"
+    TEMPORARY_FILE = "temporary_file"
+    CACHE_ENTRY = "cache_entry"
+
+
+@dataclass
+class TTSResource:
+    """Represents a TTS resource that needs cleanup"""
+    resource_id: str
+    resource_type: TTSResourceType
+    resource_ref: Any
+    created_at: float = field(default_factory=time.time)
+    last_accessed: float = field(default_factory=time.time)
+    size_bytes: int = 0
+    cleanup_handler: Optional[Callable] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def is_stale(self, max_age: float = DEFAULT_STALE_REQUEST_AGE) -> bool:
+        """Check if resource is stale and should be cleaned up"""
+        return time.time() - self.last_accessed > max_age
+    
+    def update_access_time(self):
+        """Update last accessed time"""
+        self.last_accessed = time.time()
+    
+    def cleanup(self):
+        """Clean up the resource"""
+        try:
+            if self.cleanup_handler:
+                self.cleanup_handler(self.resource_ref)
+            elif hasattr(self.resource_ref, 'close'):
+                self.resource_ref.close()
+            elif hasattr(self.resource_ref, 'shutdown'):
+                self.resource_ref.shutdown()
+        except Exception as e:
+            logger.error(f"Error cleaning up resource {self.resource_id}: {e}")
+
+
+class TTSResourceManager:
+    """Manages TTS resources and automatic cleanup"""
+    
+    def __init__(self):
+        self._resources: Dict[str, TTSResource] = {}
+        self._resource_locks: Dict[str, threading.Lock] = {}
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self._leak_detection_task: Optional[asyncio.Task] = None
+        self._memory_monitor_task: Optional[asyncio.Task] = None
+        self._running = False
+        self._total_memory_usage = 0
+        self._peak_memory_usage = 0
+        self._cleanup_count = 0
+        self._leak_detection_count = 0
+        
+    async def start(self):
+        """Start the resource manager"""
+        self._running = True
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        self._leak_detection_task = asyncio.create_task(self._leak_detection_loop())
+        self._memory_monitor_task = asyncio.create_task(self._memory_monitor_loop())
+        logger.info("TTSResourceManager started")
+    
+    async def stop(self):
+        """Stop the resource manager and cleanup all resources"""
+        self._running = False
+        
+        # Cancel background tasks
+        for task in [self._cleanup_task, self._leak_detection_task, self._memory_monitor_task]:
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        
+        # Clean up all resources
+        await self._cleanup_all_resources()
+        logger.info(f"TTSResourceManager stopped (cleaned up {self._cleanup_count} resources)")
+    
+    def register_resource(self, resource: TTSResource) -> str:
+        """Register a resource for cleanup tracking"""
+        resource_id = resource.resource_id
+        self._resources[resource_id] = resource
+        self._resource_locks[resource_id] = threading.Lock()
+        self._total_memory_usage += resource.size_bytes
+        self._peak_memory_usage = max(self._peak_memory_usage, self._total_memory_usage)
+        logger.debug(f"Registered resource {resource_id} ({resource.resource_type.value})")
+        return resource_id
+    
+    def unregister_resource(self, resource_id: str) -> bool:
+        """Unregister and cleanup a resource"""
+        if resource_id in self._resources:
+            resource = self._resources[resource_id]
+            resource.cleanup()
+            self._total_memory_usage -= resource.size_bytes
+            del self._resources[resource_id]
+            del self._resource_locks[resource_id]
+            self._cleanup_count += 1
+            logger.debug(f"Unregistered resource {resource_id}")
+            return True
+        return False
+    
+    def access_resource(self, resource_id: str) -> Optional[TTSResource]:
+        """Access a resource and update its access time"""
+        if resource_id in self._resources:
+            resource = self._resources[resource_id]
+            resource.update_access_time()
+            return resource
+        return None
+    
+    @contextmanager
+    def resource_context(self, resource_type: TTSResourceType, resource_ref: Any, 
+                        cleanup_handler: Optional[Callable] = None, size_bytes: int = 0):
+        """Context manager for automatic resource cleanup"""
+        resource = TTSResource(
+            resource_id=str(uuid.uuid4()),
+            resource_type=resource_type,
+            resource_ref=resource_ref,
+            cleanup_handler=cleanup_handler,
+            size_bytes=size_bytes
+        )
+        
+        try:
+            resource_id = self.register_resource(resource)
+            yield resource_ref
+        finally:
+            self.unregister_resource(resource_id)
+    
+    async def _cleanup_loop(self):
+        """Background task for periodic cleanup"""
+        while self._running:
+            try:
+                await asyncio.sleep(DEFAULT_CLEANUP_INTERVAL)
+                await self._cleanup_stale_resources()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in cleanup loop: {e}")
+    
+    async def _cleanup_stale_resources(self):
+        """Clean up stale resources"""
+        stale_resources = []
+        current_time = time.time()
+        
+        for resource_id, resource in self._resources.items():
+            if resource.is_stale():
+                stale_resources.append(resource_id)
+        
+        for resource_id in stale_resources:
+            self.unregister_resource(resource_id)
+            
+        if stale_resources:
+            logger.info(f"Cleaned up {len(stale_resources)} stale resources")
+    
+    async def _leak_detection_loop(self):
+        """Background task for resource leak detection"""
+        while self._running:
+            try:
+                await asyncio.sleep(DEFAULT_RESOURCE_LEAK_CHECK_INTERVAL)
+                await self._detect_leaks()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in leak detection loop: {e}")
+    
+    async def _detect_leaks(self):
+        """Detect potential resource leaks"""
+        current_time = time.time()
+        long_lived_resources = []
+        
+        for resource_id, resource in self._resources.items():
+            age = current_time - resource.created_at
+            if age > DEFAULT_STALE_REQUEST_AGE * 2:  # 10 minutes
+                long_lived_resources.append((resource_id, age, resource.resource_type))
+        
+        if long_lived_resources:
+            logger.warning(f"Potential resource leaks detected: {len(long_lived_resources)} long-lived resources")
+            for resource_id, age, resource_type in long_lived_resources:
+                logger.warning(f"  - {resource_id} ({resource_type.value}): {age:.1f}s old")
+            self._leak_detection_count += len(long_lived_resources)
+    
+    async def _memory_monitor_loop(self):
+        """Background task for memory monitoring"""
+        while self._running:
+            try:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                await self._monitor_memory_usage()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in memory monitor loop: {e}")
+    
+    async def _monitor_memory_usage(self):
+        """Monitor memory usage and trigger cleanup if needed"""
+        try:
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            current_memory = memory_info.rss
+            
+            if current_memory > DEFAULT_MEMORY_THRESHOLD:
+                logger.warning(f"High memory usage detected: {current_memory / 1024 / 1024:.1f}MB")
+                await self._emergency_cleanup()
+                
+                # Force garbage collection
+                gc.collect()
+                
+                # Check memory again after cleanup
+                new_memory = psutil.Process().memory_info().rss
+                logger.info(f"Memory after cleanup: {new_memory / 1024 / 1024:.1f}MB")
+        except Exception as e:
+            logger.error(f"Error monitoring memory: {e}")
+    
+    async def _emergency_cleanup(self):
+        """Perform emergency cleanup when memory usage is high"""
+        # Clean up all stale resources immediately
+        await self._cleanup_stale_resources()
+        
+        # Clean up oldest resources if still over threshold
+        if len(self._resources) > 10:
+            oldest_resources = sorted(
+                self._resources.items(),
+                key=lambda x: x[1].created_at
+            )[:len(self._resources) // 2]
+            
+            for resource_id, _ in oldest_resources:
+                self.unregister_resource(resource_id)
+            
+            logger.info(f"Emergency cleanup removed {len(oldest_resources)} oldest resources")
+    
+    async def _cleanup_all_resources(self):
+        """Clean up all registered resources"""
+        resource_ids = list(self._resources.keys())
+        for resource_id in resource_ids:
+            self.unregister_resource(resource_id)
+    
+    def get_resource_stats(self) -> Dict[str, Any]:
+        """Get resource usage statistics"""
+        resource_types = {}
+        for resource in self._resources.values():
+            resource_type = resource.resource_type.value
+            if resource_type not in resource_types:
+                resource_types[resource_type] = 0
+            resource_types[resource_type] += 1
+        
+        return {
+            "total_resources": len(self._resources),
+            "total_memory_usage": self._total_memory_usage,
+            "peak_memory_usage": self._peak_memory_usage,
+            "cleanup_count": self._cleanup_count,
+            "leak_detection_count": self._leak_detection_count,
+            "resource_types": resource_types
+        }
 
 
 class AsyncTTSInterface(ABC):
@@ -430,11 +694,12 @@ class AsyncTTSWorker(AsyncTTSInterface):
     Background worker for processing TTS requests with ThreadPoolExecutor infrastructure
     """
     
-    def __init__(self, worker_id: str, queue: AsyncTTSQueue, tts_client, max_thread_workers: int = 2):
+    def __init__(self, worker_id: str, queue: AsyncTTSQueue, tts_client, max_thread_workers: int = 2, resource_manager: Optional[TTSResourceManager] = None):
         self.worker_id = worker_id
         self.queue = queue
         self.tts_client = tts_client
         self.max_thread_workers = max_thread_workers
+        self.resource_manager = resource_manager
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._processed_count = 0
@@ -442,6 +707,7 @@ class AsyncTTSWorker(AsyncTTSInterface):
         self._consecutive_errors = 0
         self._last_error_time = 0.0
         self._thread_pool: Optional[ThreadPoolExecutor] = None
+        self._thread_pool_resource_id: Optional[str] = None
         self._thread_health_monitor: Optional[asyncio.Task] = None
         self._restart_count = 0
         self._last_restart_time = 0.0
@@ -465,6 +731,16 @@ class AsyncTTSWorker(AsyncTTSInterface):
             max_workers=self.max_thread_workers,
             thread_name_prefix=f"tts-worker-{self.worker_id}"
         )
+        
+        # Register thread pool with resource manager
+        if self.resource_manager:
+            resource = TTSResource(
+                resource_id=f"thread-pool-{self.worker_id}",
+                resource_type=TTSResourceType.THREAD_POOL,
+                resource_ref=self._thread_pool,
+                cleanup_handler=lambda tp: tp.shutdown(wait=False, cancel_futures=True)
+            )
+            self._thread_pool_resource_id = self.resource_manager.register_resource(resource)
         
         # Start main worker loop
         self._task = asyncio.create_task(self._worker_loop())
@@ -497,8 +773,11 @@ class AsyncTTSWorker(AsyncTTSInterface):
             except asyncio.CancelledError:
                 pass
         
-        # Shutdown thread pool
-        if self._thread_pool:
+        # Unregister and shutdown thread pool
+        if self._thread_pool_resource_id and self.resource_manager:
+            self.resource_manager.unregister_resource(self._thread_pool_resource_id)
+            self._thread_pool_resource_id = None
+        elif self._thread_pool:
             self._thread_pool.shutdown(wait=True, cancel_futures=True)
             self._thread_pool = None
         
@@ -784,6 +1063,7 @@ class AsyncTTSEngine:
         self._running = False
         self._shutdown_event = asyncio.Event()
         self._memory_monitor_task: Optional[asyncio.Task] = None
+        self.resource_manager = TTSResourceManager()
         
         # Setup signal handlers
         self._setup_signal_handlers()
@@ -804,6 +1084,9 @@ class AsyncTTSEngine:
         
         logger.info("Starting AsyncTTSEngine...")
         
+        # Start resource manager
+        await self.resource_manager.start()
+        
         # Initialize TTS client
         await self._initialize_tts_client()
         
@@ -816,7 +1099,8 @@ class AsyncTTSEngine:
                 f"worker-{i}", 
                 self.queue, 
                 self.tts_client,
-                max_thread_workers=2  # Each worker gets 2 threads
+                max_thread_workers=2,  # Each worker gets 2 threads
+                resource_manager=self.resource_manager
             )
             await worker.start()
             self.workers.append(worker)
@@ -882,6 +1166,9 @@ class AsyncTTSEngine:
         
         # Stop queue
         await self.queue.stop()
+        
+        # Stop resource manager
+        await self.resource_manager.stop()
         
         # Cleanup
         await self._cleanup_resources()
@@ -979,6 +1266,9 @@ class AsyncTTSEngine:
             ) / max(len(worker_health), 1)
         }
         
+        # Resource manager stats
+        resource_stats = self.resource_manager.get_resource_stats()
+        
         return {
             "engine_running": self._running,
             "queue_health": queue_health,
@@ -986,13 +1276,15 @@ class AsyncTTSEngine:
             "healthy_workers": sum(1 for w in worker_health if w["is_healthy"]),
             "total_workers": len(self.workers),
             "thread_pool_summary": thread_pool_summary,
+            "resource_stats": resource_stats,
             "memory_usage_mb": process.memory_info().rss / 1024 / 1024,
             "cpu_percent": process.cpu_percent(),
             "is_healthy": (
                 self._running and 
                 queue_health["is_healthy"] and 
                 sum(1 for w in worker_health if w["is_healthy"]) >= len(self.workers) // 2 and
-                thread_pool_summary["thread_utilization"] < 0.9  # Not overloaded
+                thread_pool_summary["thread_utilization"] < 0.9 and  # Not overloaded
+                resource_stats["total_resources"] < 100  # Resource limit
             )
         }
 
@@ -1145,6 +1437,16 @@ async def test_async_engine():
         print(f"  - Queue size: {final_health['queue_health']['queue_size']}")
         print(f"  - Total restarts: {final_health['thread_pool_summary']['total_worker_restarts']}")
         print(f"  - Thread pool efficiency: {final_health['thread_pool_summary']['thread_pool_efficiency']:.2%}")
+        
+        # Test resource management
+        resource_stats = final_health['resource_stats']
+        print(f"\nResource Management:")
+        print(f"  - Total resources: {resource_stats['total_resources']}")
+        print(f"  - Memory usage: {resource_stats['total_memory_usage'] / 1024 / 1024:.1f}MB")
+        print(f"  - Peak memory: {resource_stats['peak_memory_usage'] / 1024 / 1024:.1f}MB")
+        print(f"  - Cleanup count: {resource_stats['cleanup_count']}")
+        print(f"  - Leak detection count: {resource_stats['leak_detection_count']}")
+        print(f"  - Resource types: {resource_stats['resource_types']}")
         
         # Test worker health details
         for i, worker in enumerate(final_health['worker_health']):

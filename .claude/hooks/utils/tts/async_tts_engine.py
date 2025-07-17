@@ -54,6 +54,7 @@ import os
 import traceback
 import resource
 import sys
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -1761,6 +1762,441 @@ async def async_tts_context(max_workers: int = DEFAULT_WORKER_THREADS):
         await engine.shutdown()
 
 
+class TTSPerformanceMetrics:
+    """Performance metrics collection for TTS operations"""
+    
+    def __init__(self):
+        self._metrics = {
+            'total_requests': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'average_execution_time': 0.0,
+            'min_execution_time': float('inf'),
+            'max_execution_time': 0.0,
+            'total_execution_time': 0.0,
+            'queue_depth_samples': [],
+            'queue_latency_samples': [],
+            'concurrent_requests': 0,
+            'peak_concurrent_requests': 0,
+            'throughput_samples': [],
+            'bottleneck_events': [],
+            'performance_alerts': []
+        }
+        self._lock = threading.Lock()
+        self._request_start_times: Dict[str, float] = {}
+        self._last_throughput_check = time.time()
+        self._throughput_window = 60.0  # 1 minute window
+        
+    def record_request_start(self, request_id: str):
+        """Record when a request started processing"""
+        with self._lock:
+            self._request_start_times[request_id] = time.time()
+            self._metrics['total_requests'] += 1
+            self._metrics['concurrent_requests'] += 1
+            self._metrics['peak_concurrent_requests'] = max(
+                self._metrics['peak_concurrent_requests'],
+                self._metrics['concurrent_requests']
+            )
+    
+    def record_request_completion(self, request_id: str, success: bool = True):
+        """Record when a request completed"""
+        with self._lock:
+            if request_id in self._request_start_times:
+                execution_time = time.time() - self._request_start_times[request_id]
+                del self._request_start_times[request_id]
+                
+                # Update execution time metrics
+                self._metrics['total_execution_time'] += execution_time
+                self._metrics['min_execution_time'] = min(
+                    self._metrics['min_execution_time'], execution_time
+                )
+                self._metrics['max_execution_time'] = max(
+                    self._metrics['max_execution_time'], execution_time
+                )
+                
+                # Update average
+                completed_requests = self._metrics['successful_requests'] + self._metrics['failed_requests']
+                if completed_requests > 0:
+                    self._metrics['average_execution_time'] = (
+                        self._metrics['total_execution_time'] / completed_requests
+                    )
+                
+                # Update success/failure counts
+                if success:
+                    self._metrics['successful_requests'] += 1
+                else:
+                    self._metrics['failed_requests'] += 1
+                
+                self._metrics['concurrent_requests'] -= 1
+    
+    def record_queue_depth(self, depth: int):
+        """Record current queue depth"""
+        with self._lock:
+            self._metrics['queue_depth_samples'].append({
+                'timestamp': time.time(),
+                'depth': depth
+            })
+            # Keep only last 100 samples
+            if len(self._metrics['queue_depth_samples']) > 100:
+                self._metrics['queue_depth_samples'].pop(0)
+    
+    def record_queue_latency(self, latency: float):
+        """Record queue latency (time from enqueue to dequeue)"""
+        with self._lock:
+            self._metrics['queue_latency_samples'].append({
+                'timestamp': time.time(),
+                'latency': latency
+            })
+            # Keep only last 100 samples
+            if len(self._metrics['queue_latency_samples']) > 100:
+                self._metrics['queue_latency_samples'].pop(0)
+    
+    def record_throughput(self):
+        """Record current throughput (requests per second)"""
+        current_time = time.time()
+        with self._lock:
+            time_diff = current_time - self._last_throughput_check
+            if time_diff >= self._throughput_window:
+                requests_in_window = self._metrics['successful_requests'] + self._metrics['failed_requests']
+                throughput = requests_in_window / time_diff if time_diff > 0 else 0
+                
+                self._metrics['throughput_samples'].append({
+                    'timestamp': current_time,
+                    'throughput': throughput
+                })
+                
+                # Keep only last 60 samples (1 hour at 1-minute intervals)
+                if len(self._metrics['throughput_samples']) > 60:
+                    self._metrics['throughput_samples'].pop(0)
+                
+                self._last_throughput_check = current_time
+    
+    def record_bottleneck_event(self, event_type: str, details: Dict[str, Any]):
+        """Record a performance bottleneck event"""
+        with self._lock:
+            self._metrics['bottleneck_events'].append({
+                'timestamp': time.time(),
+                'type': event_type,
+                'details': details
+            })
+            # Keep only last 50 events
+            if len(self._metrics['bottleneck_events']) > 50:
+                self._metrics['bottleneck_events'].pop(0)
+    
+    def record_performance_alert(self, alert_type: str, message: str, severity: str = "warning"):
+        """Record a performance alert"""
+        with self._lock:
+            self._metrics['performance_alerts'].append({
+                'timestamp': time.time(),
+                'type': alert_type,
+                'message': message,
+                'severity': severity
+            })
+            # Keep only last 25 alerts
+            if len(self._metrics['performance_alerts']) > 25:
+                self._metrics['performance_alerts'].pop(0)
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get current performance metrics"""
+        with self._lock:
+            metrics = self._metrics.copy()
+            
+            # Calculate derived metrics
+            if metrics['total_requests'] > 0:
+                metrics['success_rate'] = (
+                    metrics['successful_requests'] / metrics['total_requests'] * 100
+                )
+                metrics['failure_rate'] = (
+                    metrics['failed_requests'] / metrics['total_requests'] * 100
+                )
+            else:
+                metrics['success_rate'] = 0.0
+                metrics['failure_rate'] = 0.0
+            
+            # Calculate queue statistics
+            if metrics['queue_depth_samples']:
+                depths = [s['depth'] for s in metrics['queue_depth_samples']]
+                metrics['average_queue_depth'] = sum(depths) / len(depths)
+                metrics['max_queue_depth'] = max(depths)
+            else:
+                metrics['average_queue_depth'] = 0.0
+                metrics['max_queue_depth'] = 0
+            
+            # Calculate latency statistics
+            if metrics['queue_latency_samples']:
+                latencies = [s['latency'] for s in metrics['queue_latency_samples']]
+                metrics['average_queue_latency'] = sum(latencies) / len(latencies)
+                metrics['max_queue_latency'] = max(latencies)
+            else:
+                metrics['average_queue_latency'] = 0.0
+                metrics['max_queue_latency'] = 0.0
+            
+            # Calculate current throughput
+            if metrics['throughput_samples']:
+                recent_throughput = metrics['throughput_samples'][-1]['throughput']
+                metrics['current_throughput'] = recent_throughput
+            else:
+                metrics['current_throughput'] = 0.0
+            
+            return metrics
+    
+    def reset_metrics(self):
+        """Reset all metrics to initial state"""
+        with self._lock:
+            self._metrics = {
+                'total_requests': 0,
+                'successful_requests': 0,
+                'failed_requests': 0,
+                'average_execution_time': 0.0,
+                'min_execution_time': float('inf'),
+                'max_execution_time': 0.0,
+                'total_execution_time': 0.0,
+                'queue_depth_samples': [],
+                'queue_latency_samples': [],
+                'concurrent_requests': 0,
+                'peak_concurrent_requests': 0,
+                'throughput_samples': [],
+                'bottleneck_events': [],
+                'performance_alerts': []
+            }
+            self._request_start_times.clear()
+            self._last_throughput_check = time.time()
+
+
+class TTSPerformanceMonitor:
+    """Comprehensive performance monitoring and alerting system"""
+    
+    def __init__(self, metrics: TTSPerformanceMetrics, config: Dict[str, Any]):
+        self.metrics = metrics
+        self.config = config
+        self._monitoring_task: Optional[asyncio.Task] = None
+        self._running = False
+        
+        # Performance thresholds
+        self.thresholds = {
+            'max_execution_time': config.get('max_execution_time', 30.0),
+            'max_queue_depth': config.get('max_queue_depth', 20),
+            'max_queue_latency': config.get('max_queue_latency', 10.0),
+            'min_throughput': config.get('min_throughput', 1.0),
+            'max_concurrent_requests': config.get('max_concurrent_requests', 10),
+            'max_failure_rate': config.get('max_failure_rate', 10.0),
+            'bottleneck_threshold': config.get('bottleneck_threshold', 5.0)
+        }
+        
+        # Dashboard configuration
+        self.dashboard_config = {
+            'log_interval': config.get('log_interval', 60),  # seconds
+            'alert_cooldown': config.get('alert_cooldown', 300),  # 5 minutes
+            'performance_log_file': config.get('performance_log_file', '.tts_performance.log')
+        }
+        
+        self._last_alert_times: Dict[str, float] = {}
+        self._performance_history: List[Dict[str, Any]] = []
+        
+    async def start(self):
+        """Start performance monitoring"""
+        self._running = True
+        self._monitoring_task = asyncio.create_task(self._monitoring_loop())
+        logger.info("TTSPerformanceMonitor started")
+        
+    async def stop(self):
+        """Stop performance monitoring"""
+        self._running = False
+        if self._monitoring_task:
+            self._monitoring_task.cancel()
+            try:
+                await self._monitoring_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("TTSPerformanceMonitor stopped")
+        
+    async def _monitoring_loop(self):
+        """Main monitoring loop"""
+        while self._running:
+            try:
+                await self._check_performance_metrics()
+                await self._update_dashboard()
+                await asyncio.sleep(self.dashboard_config['log_interval'])
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Performance monitoring error: {e}")
+                await asyncio.sleep(30)
+    
+    async def _check_performance_metrics(self):
+        """Check performance metrics against thresholds"""
+        current_metrics = self.metrics.get_metrics()
+        
+        # Check execution time
+        if current_metrics['max_execution_time'] > self.thresholds['max_execution_time']:
+            await self._trigger_alert(
+                'execution_time',
+                f"High execution time detected: {current_metrics['max_execution_time']:.2f}s",
+                'warning'
+            )
+        
+        # Check queue depth
+        if current_metrics.get('max_queue_depth', 0) > self.thresholds['max_queue_depth']:
+            await self._trigger_alert(
+                'queue_depth',
+                f"High queue depth: {current_metrics['max_queue_depth']}",
+                'warning'
+            )
+            
+            # Record bottleneck event
+            self.metrics.record_bottleneck_event('high_queue_depth', {
+                'queue_depth': current_metrics['max_queue_depth'],
+                'threshold': self.thresholds['max_queue_depth']
+            })
+        
+        # Check queue latency
+        if current_metrics.get('max_queue_latency', 0) > self.thresholds['max_queue_latency']:
+            await self._trigger_alert(
+                'queue_latency',
+                f"High queue latency: {current_metrics['max_queue_latency']:.2f}s",
+                'warning'
+            )
+        
+        # Check throughput
+        if current_metrics.get('current_throughput', 0) < self.thresholds['min_throughput']:
+            await self._trigger_alert(
+                'low_throughput',
+                f"Low throughput: {current_metrics['current_throughput']:.2f} req/s",
+                'warning'
+            )
+        
+        # Check failure rate
+        if current_metrics.get('failure_rate', 0) > self.thresholds['max_failure_rate']:
+            await self._trigger_alert(
+                'high_failure_rate',
+                f"High failure rate: {current_metrics['failure_rate']:.1f}%",
+                'error'
+            )
+        
+        # Check concurrent requests
+        if current_metrics['concurrent_requests'] > self.thresholds['max_concurrent_requests']:
+            await self._trigger_alert(
+                'high_concurrency',
+                f"High concurrent requests: {current_metrics['concurrent_requests']}",
+                'warning'
+            )
+        
+        # Detect bottlenecks
+        await self._detect_bottlenecks(current_metrics)
+    
+    async def _detect_bottlenecks(self, metrics: Dict[str, Any]):
+        """Detect performance bottlenecks"""
+        # Check if average execution time is increasing
+        if len(self._performance_history) >= 3:
+            recent_avg_times = [
+                h.get('average_execution_time', 0) 
+                for h in self._performance_history[-3:]
+            ]
+            if all(recent_avg_times[i] < recent_avg_times[i+1] for i in range(len(recent_avg_times)-1)):
+                self.metrics.record_bottleneck_event('increasing_execution_time', {
+                    'trend': recent_avg_times,
+                    'current_avg': metrics['average_execution_time']
+                })
+        
+        # Check for queue buildup
+        if metrics.get('average_queue_depth', 0) > self.thresholds['bottleneck_threshold']:
+            if metrics['concurrent_requests'] < self.thresholds['max_concurrent_requests']:
+                self.metrics.record_bottleneck_event('queue_buildup', {
+                    'queue_depth': metrics['average_queue_depth'],
+                    'concurrent_requests': metrics['concurrent_requests']
+                })
+    
+    async def _trigger_alert(self, alert_type: str, message: str, severity: str):
+        """Trigger performance alert with cooldown"""
+        current_time = time.time()
+        last_alert_time = self._last_alert_times.get(alert_type, 0)
+        
+        if current_time - last_alert_time >= self.dashboard_config['alert_cooldown']:
+            self.metrics.record_performance_alert(alert_type, message, severity)
+            self._last_alert_times[alert_type] = current_time
+            
+            # Log alert
+            log_level = logging.ERROR if severity == 'error' else logging.WARNING
+            logger.log(log_level, f"TTS Performance Alert ({alert_type}): {message}")
+    
+    async def _update_dashboard(self):
+        """Update performance dashboard and logs"""
+        current_metrics = self.metrics.get_metrics()
+        
+        # Add to history
+        self._performance_history.append({
+            'timestamp': time.time(),
+            **current_metrics
+        })
+        
+        # Keep only last 60 entries (1 hour at 1-minute intervals)
+        if len(self._performance_history) > 60:
+            self._performance_history.pop(0)
+        
+        # Log performance summary
+        logger.info(
+            f"TTS Performance: {current_metrics['total_requests']} requests, "
+            f"{current_metrics['success_rate']:.1f}% success, "
+            f"{current_metrics['average_execution_time']:.2f}s avg time, "
+            f"{current_metrics.get('current_throughput', 0):.2f} req/s throughput"
+        )
+        
+        # Write to performance log file
+        await self._write_performance_log(current_metrics)
+    
+    async def _write_performance_log(self, metrics: Dict[str, Any]):
+        """Write performance metrics to log file"""
+        try:
+            log_entry = {
+                'timestamp': time.time(),
+                'datetime': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'metrics': metrics
+            }
+            
+            log_file = self.dashboard_config['performance_log_file']
+            with open(log_file, 'a') as f:
+                f.write(f"{json.dumps(log_entry)}\n")
+                
+        except Exception as e:
+            logger.error(f"Failed to write performance log: {e}")
+    
+    def get_dashboard_data(self) -> Dict[str, Any]:
+        """Get data for performance dashboard"""
+        current_metrics = self.metrics.get_metrics()
+        
+        return {
+            'current_metrics': current_metrics,
+            'performance_history': self._performance_history[-20:],  # Last 20 entries
+            'thresholds': self.thresholds,
+            'recent_alerts': current_metrics.get('performance_alerts', [])[-10:],  # Last 10 alerts
+            'bottleneck_events': current_metrics.get('bottleneck_events', [])[-10:],  # Last 10 events
+            'health_status': self._calculate_health_status(current_metrics)
+        }
+    
+    def _calculate_health_status(self, metrics: Dict[str, Any]) -> str:
+        """Calculate overall health status"""
+        issues = []
+        
+        if metrics.get('failure_rate', 0) > self.thresholds['max_failure_rate']:
+            issues.append('high_failure_rate')
+        
+        if metrics.get('max_queue_depth', 0) > self.thresholds['max_queue_depth']:
+            issues.append('high_queue_depth')
+        
+        if metrics.get('current_throughput', 0) < self.thresholds['min_throughput']:
+            issues.append('low_throughput')
+        
+        if metrics.get('max_execution_time', 0) > self.thresholds['max_execution_time']:
+            issues.append('high_execution_time')
+        
+        if len(issues) == 0:
+            return 'healthy'
+        elif len(issues) <= 2:
+            return 'warning'
+        else:
+            return 'critical'
+
+
 class AsyncTTSEngine:
     """
     Main asynchronous TTS execution engine
@@ -1769,7 +2205,7 @@ class AsyncTTSEngine:
     for non-blocking TTS operations.
     """
     
-    def __init__(self, max_workers: int = DEFAULT_WORKER_THREADS, memory_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, max_workers: int = DEFAULT_WORKER_THREADS, memory_config: Optional[Dict[str, Any]] = None, performance_config: Optional[Dict[str, Any]] = None):
         self.max_workers = max_workers
         self.queue = AsyncTTSQueue()
         self.workers: List[AsyncTTSWorker] = []
@@ -1790,6 +2226,22 @@ class AsyncTTSEngine:
             'oom_threshold': 0.95
         }
         self.memory_manager = TTSMemoryManager(self._memory_config)
+        
+        # Initialize performance monitoring
+        self._performance_config = performance_config or {
+            'max_execution_time': 30.0,
+            'max_queue_depth': 20,
+            'max_queue_latency': 10.0,
+            'min_throughput': 1.0,
+            'max_concurrent_requests': 10,
+            'max_failure_rate': 10.0,
+            'bottleneck_threshold': 5.0,
+            'log_interval': 60,
+            'alert_cooldown': 300,
+            'performance_log_file': '.tts_performance.log'
+        }
+        self.performance_metrics = TTSPerformanceMetrics()
+        self.performance_monitor = TTSPerformanceMonitor(self.performance_metrics, self._performance_config)
         
         # Initialize shutdown manager
         self.shutdown_manager = TTSShutdownManager("AsyncTTSEngine")
@@ -1835,6 +2287,9 @@ class AsyncTTSEngine:
         
         # Start memory management
         await self.memory_manager.start()
+        
+        # Start performance monitoring
+        await self.performance_monitor.start()
         
         # Register shutdown callbacks
         self.shutdown_manager.add_shutdown_callback(self._shutdown_phase_stop_workers)
@@ -1909,6 +2364,13 @@ class AsyncTTSEngine:
                 context={"source": "async_engine"}
             )
         
+        # Record performance metrics
+        self.performance_metrics.record_request_start(request.request_id)
+        
+        # Record queue metrics
+        queue_depth = len(self.queue._queue)
+        self.performance_metrics.record_queue_depth(queue_depth)
+        
         # Register request for shutdown tracking
         self.shutdown_manager.register_in_flight_request(request)
         
@@ -1916,6 +2378,7 @@ class AsyncTTSEngine:
         if not success:
             # Remove from tracking if enqueue failed
             self.shutdown_manager.unregister_in_flight_request(request.request_id)
+            self.performance_metrics.record_request_completion(request.request_id, success=False)
             raise RuntimeError("TTS queue is full")
         
         return request.request_id
@@ -1936,6 +2399,14 @@ class AsyncTTSEngine:
         """Force memory cleanup and garbage collection"""
         await self.memory_manager.handle_memory_pressure()
     
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        """Get current performance metrics"""
+        return self.performance_metrics.get_metrics()
+    
+    def get_performance_dashboard(self) -> Dict[str, Any]:
+        """Get performance dashboard data"""
+        return self.performance_monitor.get_dashboard_data()
+    
     def get_shutdown_status(self) -> Dict[str, Any]:
         """Get current shutdown status"""
         return self.shutdown_manager.get_shutdown_status()
@@ -1946,6 +2417,9 @@ class AsyncTTSEngine:
     
     async def _handle_request_completion(self, request_id: str, success: bool = True):
         """Handle request completion and cleanup"""
+        # Record performance metrics
+        self.performance_metrics.record_request_completion(request_id, success)
+        
         # Remove from shutdown tracking
         self.shutdown_manager.unregister_in_flight_request(request_id)
         
@@ -2035,17 +2509,20 @@ class AsyncTTSEngine:
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     pass
             
+            # Stop performance monitoring
+            await asyncio.wait_for(self.performance_monitor.stop(), timeout=timeout/5)
+            
             # Stop queue
-            await asyncio.wait_for(self.queue.stop(), timeout=timeout/4)
+            await asyncio.wait_for(self.queue.stop(), timeout=timeout/5)
             
             # Stop resource manager
-            await asyncio.wait_for(self.resource_manager.stop(), timeout=timeout/4)
+            await asyncio.wait_for(self.resource_manager.stop(), timeout=timeout/5)
             
             # Stop memory management
-            await asyncio.wait_for(self.memory_manager.stop(), timeout=timeout/4)
+            await asyncio.wait_for(self.memory_manager.stop(), timeout=timeout/5)
             
             # Final cleanup
-            await asyncio.wait_for(self._cleanup_resources(), timeout=timeout/4)
+            await asyncio.wait_for(self._cleanup_resources(), timeout=timeout/5)
             
             # Set engine state
             self._running = False
@@ -2153,6 +2630,10 @@ class AsyncTTSEngine:
         # Resource manager stats
         resource_stats = self.resource_manager.get_resource_stats()
         
+        # Performance metrics
+        performance_metrics = self.performance_metrics.get_metrics()
+        performance_dashboard = self.performance_monitor.get_dashboard_data()
+        
         return {
             "engine_running": self._running,
             "queue_health": queue_health,
@@ -2161,6 +2642,8 @@ class AsyncTTSEngine:
             "total_workers": len(self.workers),
             "thread_pool_summary": thread_pool_summary,
             "resource_stats": resource_stats,
+            "performance_metrics": performance_metrics,
+            "performance_dashboard": performance_dashboard,
             "memory_usage_mb": process.memory_info().rss / 1024 / 1024,
             "cpu_percent": process.cpu_percent(),
             "is_healthy": (
@@ -2168,7 +2651,8 @@ class AsyncTTSEngine:
                 queue_health["is_healthy"] and 
                 sum(1 for w in worker_health if w["is_healthy"]) >= len(self.workers) // 2 and
                 thread_pool_summary["thread_utilization"] < 0.9 and  # Not overloaded
-                resource_stats["total_resources"] < 100  # Resource limit
+                resource_stats["total_resources"] < 100 and  # Resource limit
+                performance_dashboard["health_status"] in ["healthy", "warning"]  # Performance health
             )
         }
 
@@ -2331,6 +2815,17 @@ async def test_async_engine():
         print(f"  - Cleanup count: {resource_stats['cleanup_count']}")
         print(f"  - Leak detection count: {resource_stats['leak_detection_count']}")
         print(f"  - Resource types: {resource_stats['resource_types']}")
+        
+        # Test performance monitoring
+        performance_metrics = final_health['performance_metrics']
+        performance_dashboard = final_health['performance_dashboard']
+        print(f"\nPerformance Monitoring:")
+        print(f"  - Total requests: {performance_metrics['total_requests']}")
+        print(f"  - Success rate: {performance_metrics['success_rate']:.1f}%")
+        print(f"  - Average execution time: {performance_metrics['average_execution_time']:.2f}s")
+        print(f"  - Current throughput: {performance_metrics['current_throughput']:.2f} req/s")
+        print(f"  - Peak concurrent requests: {performance_metrics['peak_concurrent_requests']}")
+        print(f"  - Health status: {performance_dashboard['health_status']}")
         
         # Test worker health details
         for i, worker in enumerate(final_health['worker_health']):

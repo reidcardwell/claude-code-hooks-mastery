@@ -8,6 +8,11 @@ with proper type hints, defaults, and validation support.
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any, Union, Tuple
+import json
+import os
+import fcntl
+import time
+from pathlib import Path
 
 
 @dataclass
@@ -402,6 +407,209 @@ class TTSConfig:
         """
         is_valid, _ = self.validate_all()
         return is_valid
+    
+    # Settings.json Integration Methods
+    
+    @classmethod
+    def load_from_settings(cls, settings_path: Optional[str] = None) -> 'TTSConfig':
+        """
+        Load TTS configuration from .claude/settings.json file.
+        
+        Args:
+            settings_path: Optional path to settings.json file. If None, uses default location.
+            
+        Returns:
+            TTSConfig: Configuration instance loaded from settings.json
+        """
+        if settings_path is None:
+            settings_path = Path.cwd() / '.claude' / 'settings.json'
+        else:
+            settings_path = Path(settings_path)
+        
+        # Start with default configuration
+        config = cls()
+        
+        # Check if settings file exists
+        if not settings_path.exists():
+            return config
+        
+        try:
+            # Read settings file with file locking
+            with open(settings_path, 'r', encoding='utf-8') as f:
+                # Apply shared lock for reading
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    settings_data = json.load(f)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            
+            # Extract TTS configuration section
+            tts_config = settings_data.get('tts', {})
+            
+            # Update configuration with settings data
+            if tts_config:
+                for field_name, field_value in tts_config.items():
+                    if hasattr(config, field_name):
+                        setattr(config, field_name, field_value)
+                
+                # Re-run validation after loading
+                config.__post_init__()
+            
+            return config
+            
+        except (json.JSONDecodeError, IOError, OSError) as e:
+            # Return default configuration if file is corrupted or unreadable
+            return config
+    
+    def save_to_settings(self, settings_path: Optional[str] = None) -> bool:
+        """
+        Save TTS configuration to .claude/settings.json file while preserving other settings.
+        
+        Args:
+            settings_path: Optional path to settings.json file. If None, uses default location.
+            
+        Returns:
+            bool: True if save was successful, False otherwise
+        """
+        if settings_path is None:
+            settings_path = Path.cwd() / '.claude' / 'settings.json'
+        else:
+            settings_path = Path(settings_path)
+        
+        # Ensure directory exists
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Validate configuration before saving
+        if not self.is_valid():
+            return False
+        
+        try:
+            # Read existing settings or create new structure
+            existing_settings = {}
+            if settings_path.exists():
+                with open(settings_path, 'r', encoding='utf-8') as f:
+                    # Apply shared lock for reading
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                    try:
+                        existing_settings = json.load(f)
+                    except json.JSONDecodeError:
+                        existing_settings = {}
+                    finally:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            
+            # Update TTS section while preserving other settings
+            existing_settings['tts'] = self.to_dict()
+            
+            # Write back to file with exclusive lock
+            with open(settings_path, 'w', encoding='utf-8') as f:
+                # Apply exclusive lock for writing
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    json.dump(existing_settings, f, indent=2, ensure_ascii=False)
+                    f.write('\n')  # Add trailing newline
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            
+            return True
+            
+        except (IOError, OSError, json.JSONEncodeError) as e:
+            return False
+    
+    @classmethod
+    def load_from_settings_with_fallback(cls, settings_path: Optional[str] = None, 
+                                       fallback_path: Optional[str] = None) -> 'TTSConfig':
+        """
+        Load TTS configuration with fallback to .claude/tts.json if settings.json doesn't contain TTS config.
+        
+        Args:
+            settings_path: Optional path to settings.json file
+            fallback_path: Optional path to fallback tts.json file
+            
+        Returns:
+            TTSConfig: Configuration instance loaded from settings.json or fallback
+        """
+        # Try to load from settings.json first
+        config = cls.load_from_settings(settings_path)
+        
+        # Check if we got default config (indicating no TTS section in settings.json)
+        if settings_path is None:
+            settings_path = Path.cwd() / '.claude' / 'settings.json'
+        else:
+            settings_path = Path(settings_path)
+        
+        # Check if settings.json exists and has TTS section
+        has_tts_section = False
+        if settings_path.exists():
+            try:
+                with open(settings_path, 'r', encoding='utf-8') as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                    try:
+                        settings_data = json.load(f)
+                        has_tts_section = 'tts' in settings_data
+                    finally:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except (json.JSONDecodeError, IOError, OSError):
+                pass
+        
+        # If no TTS section found, try fallback
+        if not has_tts_section:
+            if fallback_path is None:
+                fallback_path = Path.cwd() / '.claude' / 'tts.json'
+            else:
+                fallback_path = Path(fallback_path)
+            
+            if fallback_path.exists():
+                try:
+                    with open(fallback_path, 'r', encoding='utf-8') as f:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                        try:
+                            fallback_data = json.load(f)
+                            config = cls.from_dict(fallback_data)
+                        finally:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except (json.JSONDecodeError, IOError, OSError):
+                    pass
+        
+        return config
+    
+    def migrate_to_settings(self, settings_path: Optional[str] = None, 
+                          source_path: Optional[str] = None) -> bool:
+        """
+        Migrate TTS configuration from standalone tts.json to settings.json.
+        
+        Args:
+            settings_path: Optional path to settings.json file
+            source_path: Optional path to source tts.json file
+            
+        Returns:
+            bool: True if migration was successful, False otherwise
+        """
+        if source_path is None:
+            source_path = Path.cwd() / '.claude' / 'tts.json'
+        else:
+            source_path = Path(source_path)
+        
+        # Load configuration from source file
+        if source_path.exists():
+            try:
+                with open(source_path, 'r', encoding='utf-8') as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                    try:
+                        source_data = json.load(f)
+                        # Update self with source data
+                        for field_name, field_value in source_data.items():
+                            if hasattr(self, field_name):
+                                setattr(self, field_name, field_value)
+                        
+                        # Re-run validation after loading
+                        self.__post_init__()
+                    finally:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except (json.JSONDecodeError, IOError, OSError):
+                return False
+        
+        # Save to settings.json
+        return self.save_to_settings(settings_path)
 
 
 # Default configuration instance

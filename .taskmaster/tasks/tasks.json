@@ -413,7 +413,7 @@
               2
             ],
             "details": "Extend TTSQueue with priority queue using heapq. Implement priority calculation based on request timestamp. Add priority boost for recent commands (<2 seconds). Create queue reordering logic. Implement starvation prevention for low-priority items. Add priority metrics tracking.",
-            "status": "pending",
+            "status": "done",
             "testStrategy": ""
           },
           {
@@ -1263,7 +1263,7 @@
     ],
     "metadata": {
       "created": "2025-07-15T19:44:16.184Z",
-      "updated": "2025-07-17T15:54:33.457Z",
+      "updated": "2025-07-17T16:08:14.949Z",
       "description": "Tasks for master context"
     }
   }

@@ -96,16 +96,73 @@ class TTSRequest:
     retry_count: int = 0
     max_retries: int = 3
     context: Optional[Dict[str, Any]] = None
+    _priority_score: float = field(default=0.0, init=False)
+    _last_priority_boost: float = field(default=0.0, init=False)
     
     def __post_init__(self):
+        # Calculate initial priority score
+        self._calculate_priority_score()
+        
         # Auto-boost priority for recent requests
         if time.time() - self.created_at < DEFAULT_PRIORITY_BOOST_THRESHOLD:
             if self.priority == TTSPriority.NORMAL:
                 self.priority = TTSPriority.HIGH
+                self._last_priority_boost = time.time()
+    
+    def _calculate_priority_score(self) -> None:
+        """Calculate priority score based on priority level, age, and starvation prevention"""
+        current_time = time.time()
+        age = current_time - self.created_at
+        
+        # Base priority score
+        base_score = self.priority.value * 1000
+        
+        # Age factor (older requests get slightly higher priority to prevent starvation)
+        age_factor = min(age * 10, 500)  # Cap at 500 points for age
+        
+        # Starvation prevention boost for requests waiting too long
+        starvation_boost = 0
+        if age > 30:  # 30 seconds threshold
+            starvation_boost = min((age - 30) * 50, 1000)  # Progressive boost
+        
+        # Recent command boost
+        recent_boost = 0
+        if current_time - self.created_at < DEFAULT_PRIORITY_BOOST_THRESHOLD:
+            recent_boost = 200
+        
+        # Retry penalty (lower priority for failed requests)
+        retry_penalty = self.retry_count * 50
+        
+        self._priority_score = base_score + age_factor + starvation_boost + recent_boost - retry_penalty
+    
+    def update_priority_score(self) -> None:
+        """Update priority score (called periodically to prevent starvation)"""
+        old_score = self._priority_score
+        self._calculate_priority_score()
+        
+        # Log significant priority changes
+        if abs(self._priority_score - old_score) > 100:
+            logger.debug(f"Priority score updated for {self.request_id}: {old_score:.1f} -> {self._priority_score:.1f}")
+    
+    def get_priority_metrics(self) -> Dict[str, Any]:
+        """Get priority metrics for monitoring"""
+        current_time = time.time()
+        return {
+            "request_id": self.request_id,
+            "priority_level": self.priority.name,
+            "priority_score": self._priority_score,
+            "age_seconds": current_time - self.created_at,
+            "retry_count": self.retry_count,
+            "has_recent_boost": (current_time - self.created_at) < DEFAULT_PRIORITY_BOOST_THRESHOLD,
+            "last_boost_time": self._last_priority_boost
+        }
     
     def __lt__(self, other):
-        """Priority queue comparison - higher priority first"""
-        return self.priority.value > other.priority.value
+        """Priority queue comparison - higher priority score first"""
+        # Update scores before comparison to ensure freshness
+        self.update_priority_score()
+        other.update_priority_score()
+        return self._priority_score > other._priority_score
     
     def is_expired(self, max_age: float = 60.0) -> bool:
         """Check if request has expired"""
@@ -157,10 +214,19 @@ class AsyncTTSQueue(AsyncTTSInterface):
         self._completed_requests: Dict[str, TTSRequest] = {}
         self._semaphore = asyncio.Semaphore(DEFAULT_MAX_CONCURRENT_REQUESTS)
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._priority_reorder_task: Optional[asyncio.Task] = None
+        self._priority_metrics: Dict[str, Any] = {
+            "total_requests": 0,
+            "priority_boosts": 0,
+            "starvation_prevented": 0,
+            "reorders_performed": 0,
+            "average_wait_time": 0.0
+        }
         
     async def start(self) -> None:
         """Start the queue and background tasks"""
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        self._priority_reorder_task = asyncio.create_task(self._priority_reorder_loop())
         logger.info("AsyncTTSQueue started")
     
     async def stop(self) -> None:
@@ -169,6 +235,13 @@ class AsyncTTSQueue(AsyncTTSInterface):
             self._cleanup_task.cancel()
             try:
                 await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        
+        if self._priority_reorder_task:
+            self._priority_reorder_task.cancel()
+            try:
+                await self._priority_reorder_task
             except asyncio.CancelledError:
                 pass
         
@@ -193,6 +266,11 @@ class AsyncTTSQueue(AsyncTTSInterface):
                 await self._make_room()
                 if len(self._queue) >= self.max_size:
                     return False
+            
+            # Update metrics
+            self._priority_metrics["total_requests"] += 1
+            if request.priority == TTSPriority.HIGH and time.time() - request.created_at < DEFAULT_PRIORITY_BOOST_THRESHOLD:
+                self._priority_metrics["priority_boosts"] += 1
             
             # Insert in priority order
             heapq.heappush(self._queue, request)
@@ -225,6 +303,16 @@ class AsyncTTSQueue(AsyncTTSInterface):
             if request_id in self._active_requests:
                 request = self._active_requests.pop(request_id)
                 request.status = TTSRequestStatus.COMPLETED if success else TTSRequestStatus.FAILED
+                
+                # Update metrics
+                wait_time = time.time() - request.created_at
+                current_avg = self._priority_metrics["average_wait_time"]
+                total_requests = self._priority_metrics["total_requests"]
+                self._priority_metrics["average_wait_time"] = (
+                    (current_avg * (total_requests - 1) + wait_time) / total_requests
+                    if total_requests > 0 else wait_time
+                )
+                
                 self._completed_requests[request_id] = request
                 self._semaphore.release()
     
@@ -277,16 +365,63 @@ class AsyncTTSQueue(AsyncTTSInterface):
             if expired_ids:
                 logger.debug(f"Cleaned up {len(expired_ids)} expired requests")
     
+    async def _priority_reorder_loop(self) -> None:
+        """Background task to reorder queue based on updated priorities"""
+        while True:
+            try:
+                await asyncio.sleep(5)  # Check every 5 seconds
+                await self._reorder_queue()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in priority reorder loop: {e}")
+    
+    async def _reorder_queue(self) -> None:
+        """Reorder queue based on updated priority scores"""
+        async with self._lock:
+            if len(self._queue) <= 1:
+                return
+            
+            # Update priority scores for all requests
+            starvation_prevented = 0
+            for request in self._queue:
+                old_score = request._priority_score
+                request.update_priority_score()
+                
+                # Check if starvation prevention was triggered
+                if request._priority_score - old_score > 500:  # Significant boost
+                    starvation_prevented += 1
+            
+            # Reorder queue if priorities have changed significantly
+            if starvation_prevented > 0:
+                heapq.heapify(self._queue)
+                self._priority_metrics["starvation_prevented"] += starvation_prevented
+                self._priority_metrics["reorders_performed"] += 1
+                logger.debug(f"Reordered queue: prevented {starvation_prevented} starvation cases")
+    
     async def health_check(self) -> Dict[str, Any]:
         """Return queue health status"""
         async with self._lock:
+            # Calculate priority distribution
+            priority_distribution = {p.name: 0 for p in TTSPriority}
+            for request in self._queue:
+                priority_distribution[request.priority.name] += 1
+            
+            # Get priority metrics for active requests
+            active_priorities = [
+                req.get_priority_metrics() for req in self._active_requests.values()
+            ]
+            
             return {
                 "queue_size": len(self._queue),
                 "max_size": self.max_size,
                 "active_requests": len(self._active_requests),
                 "completed_requests": len(self._completed_requests),
                 "semaphore_value": self._semaphore._value,
-                "is_healthy": len(self._queue) < self.max_size * 0.8
+                "is_healthy": len(self._queue) < self.max_size * 0.8,
+                "priority_distribution": priority_distribution,
+                "priority_metrics": self._priority_metrics.copy(),
+                "active_request_priorities": active_priorities
             }
 
 

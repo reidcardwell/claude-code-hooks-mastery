@@ -1,7 +1,7 @@
 {
   "enabled": true,
   "default_voice_id": "6sFKzaJr574YWVu4UuJF",
-  "word_count_threshold": 1,
+  "word_count_threshold": 5,
   "max_word_count": 100,
   "excluded_tools": ["Read", "Grep", "LS", "TodoRead", "Glob"],
   "enable_response_tts": true,

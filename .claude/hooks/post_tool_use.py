@@ -182,7 +182,30 @@ def should_process_tool_for_tts(tool_name, tool_input, tool_response, tts_config
             f.write(f"{timestamp}: Tool '{tool_name}' is excluded by configuration\n")
         return False
     
-    # Second check: Tool-specific filtering via registry
+    # Second check: Word count verification BEFORE tool filtering
+    if TTS_AVAILABLE:
+        try:
+            # Extract text from response
+            response_text = extract_text_from_response(tool_response)
+            clean_text = strip_ansi_codes(response_text)
+            
+            # Check word count
+            word_count_val = word_count(clean_text)
+            min_words = tts_config.get('word_count_threshold', 1)
+            max_words = tts_config.get('max_word_count', 200)
+            
+            if word_count_val < min_words or word_count_val > max_words:
+                with open(debug_log_path, 'a') as f:
+                    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                    f.write(f"{timestamp}: Word count {word_count_val} outside range {min_words}-{max_words} for '{tool_name}'\n")
+                return False
+        except Exception as e:
+            with open(debug_log_path, 'a') as f:
+                timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                f.write(f"{timestamp}: Error checking word count for '{tool_name}': {e}\n")
+            return False
+    
+    # Third check: Tool-specific filtering via registry
     if TTS_AVAILABLE:
         try:
             # Initialize registry with TTS configuration path
@@ -294,8 +317,11 @@ def extract_tts_text(tool_name, tool_input, tool_response, tts_config):
                     
                     # Generate tool-specific custom message
                     custom_message = tool_filter.get_custom_message(tool_name, tool_response)
-                    if custom_message:
+                    if custom_message is not None:
                         return custom_message
+                    else:
+                        # Tool filter returned None, use original clean text
+                        return clean_text
                 
             except Exception as e:
                 # Log filter error but continue with fallback

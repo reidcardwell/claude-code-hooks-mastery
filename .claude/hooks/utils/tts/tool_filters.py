@@ -487,6 +487,36 @@ class BashFilter(ToolFilter):
         Returns:
             Optional[str]: Success message for TTS, or None for default processing
         """
+        # First check if we have meaningful output that meets word count threshold
+        from .text_processor import word_count, strip_ansi_codes
+        
+        # Extract the actual command output
+        stdout = parsed_data.get("stdout", "")
+        stderr = parsed_data.get("stderr", "")
+        output = stdout or stderr
+        
+        if output:
+            clean_output = strip_ansi_codes(output.strip())
+            output_word_count = word_count(clean_output)
+            
+            # If output meets word count threshold, return None to use original output
+            # Load TTS config to check threshold
+            try:
+                import sys
+                import os
+                hooks_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+                sys.path.insert(0, hooks_dir)
+                from post_tool_use import load_tts_config
+                tts_config = load_tts_config()
+                min_words = tts_config.get('word_count_threshold', 1)
+                max_words = tts_config.get('max_word_count', 200)
+                
+                if min_words <= output_word_count <= max_words:
+                    return None  # Use original output for TTS
+            except Exception as e:
+                # If config loading fails, continue with generic message
+                pass
+        
         # Get command for context
         command = self._extract_command(parsed_data)
         

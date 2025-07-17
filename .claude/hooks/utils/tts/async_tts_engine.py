@@ -79,6 +79,17 @@ class TTSPriority(Enum):
     URGENT = 4
 
 
+class TTSShutdownState(Enum):
+    """Shutdown states for graceful termination"""
+    RUNNING = "running"
+    SHUTDOWN_INITIATED = "shutdown_initiated"
+    DRAINING_REQUESTS = "draining_requests"
+    STOPPING_WORKERS = "stopping_workers"
+    CLEANING_RESOURCES = "cleaning_resources"
+    SHUTDOWN_COMPLETE = "shutdown_complete"
+    FORCE_SHUTDOWN = "force_shutdown"
+
+
 class TTSRequestStatus(Enum):
     """Status of TTS requests"""
     PENDING = "pending"
@@ -786,6 +797,311 @@ class TTSMemoryManager:
         }
 
 
+class TTSShutdownManager:
+    """Manages graceful shutdown process for TTS operations"""
+    
+    def __init__(self, engine_name: str = "AsyncTTSEngine"):
+        self.engine_name = engine_name
+        self.state = TTSShutdownState.RUNNING
+        self.shutdown_start_time: Optional[float] = None
+        self.shutdown_reason: Optional[str] = None
+        self.in_flight_requests: Dict[str, TTSRequest] = {}
+        self.shutdown_callbacks: List[Callable] = []
+        self.force_shutdown_event = asyncio.Event()
+        self.shutdown_complete_event = asyncio.Event()
+        self.shutdown_lock = asyncio.Lock()
+        
+        # Shutdown statistics
+        self.shutdown_stats = {
+            "total_shutdowns": 0,
+            "graceful_shutdowns": 0,
+            "forced_shutdowns": 0,
+            "requests_drained": 0,
+            "requests_lost": 0,
+            "average_shutdown_time": 0.0
+        }
+    
+    async def initiate_shutdown(self, reason: str = "manual", timeout: float = DEFAULT_SHUTDOWN_TIMEOUT) -> bool:
+        """
+        Initiate graceful shutdown process
+        
+        Args:
+            reason: Reason for shutdown (signal, manual, error, etc.)
+            timeout: Maximum time to wait for graceful shutdown
+            
+        Returns:
+            bool: True if shutdown was successful, False if forced
+        """
+        async with self.shutdown_lock:
+            if self.state != TTSShutdownState.RUNNING:
+                logger.warning(f"Shutdown already in progress (state: {self.state.value})")
+                return await self._wait_for_shutdown_complete(timeout)
+            
+            self.shutdown_start_time = time.time()
+            self.shutdown_reason = reason
+            self.state = TTSShutdownState.SHUTDOWN_INITIATED
+            self.shutdown_stats["total_shutdowns"] += 1
+            
+            logger.info(f"Initiating graceful shutdown of {self.engine_name} (reason: {reason})")
+            
+            # Create shutdown timeout task
+            timeout_task = asyncio.create_task(self._shutdown_timeout_handler(timeout))
+            
+            try:
+                # Execute shutdown phases
+                success = await self._execute_shutdown_phases(timeout)
+                
+                if success:
+                    self.shutdown_stats["graceful_shutdowns"] += 1
+                    logger.info(f"Graceful shutdown completed in {time.time() - self.shutdown_start_time:.2f}s")
+                else:
+                    self.shutdown_stats["forced_shutdowns"] += 1
+                    logger.warning(f"Forced shutdown after {time.time() - self.shutdown_start_time:.2f}s")
+                
+                return success
+                
+            except Exception as e:
+                logger.error(f"Shutdown failed: {e}")
+                self.state = TTSShutdownState.FORCE_SHUTDOWN
+                return False
+            finally:
+                timeout_task.cancel()
+                self.shutdown_complete_event.set()
+                self._update_shutdown_stats()
+    
+    async def _execute_shutdown_phases(self, timeout: float) -> bool:
+        """Execute shutdown phases with timeout protection"""
+        phase_timeout = timeout / 4  # Divide timeout among phases
+        
+        try:
+            # Phase 1: Drain requests
+            self.state = TTSShutdownState.DRAINING_REQUESTS
+            logger.info("Phase 1: Draining in-flight requests...")
+            if not await self._drain_requests(phase_timeout):
+                return False
+            
+            # Phase 2: Stop workers
+            self.state = TTSShutdownState.STOPPING_WORKERS
+            logger.info("Phase 2: Stopping workers...")
+            if not await self._stop_workers(phase_timeout):
+                return False
+            
+            # Phase 3: Clean resources
+            self.state = TTSShutdownState.CLEANING_RESOURCES
+            logger.info("Phase 3: Cleaning resources...")
+            if not await self._clean_resources(phase_timeout):
+                return False
+            
+            # Phase 4: Complete shutdown
+            self.state = TTSShutdownState.SHUTDOWN_COMPLETE
+            logger.info("Phase 4: Shutdown complete")
+            return True
+            
+        except asyncio.TimeoutError:
+            logger.error("Shutdown phase timed out")
+            return False
+        except Exception as e:
+            logger.error(f"Shutdown phase failed: {e}")
+            return False
+    
+    async def _drain_requests(self, timeout: float) -> bool:
+        """Drain in-flight requests with timeout"""
+        try:
+            start_time = time.time()
+            drained_count = 0
+            
+            # Wait for in-flight requests to complete
+            while self.in_flight_requests and (time.time() - start_time) < timeout:
+                # Check request status and remove completed ones
+                completed_requests = []
+                for request_id, request in self.in_flight_requests.items():
+                    if request.status in [TTSRequestStatus.COMPLETED, TTSRequestStatus.FAILED, TTSRequestStatus.CANCELLED]:
+                        completed_requests.append(request_id)
+                
+                for request_id in completed_requests:
+                    del self.in_flight_requests[request_id]
+                    drained_count += 1
+                
+                if self.in_flight_requests:
+                    await asyncio.sleep(0.1)  # Short delay before next check
+            
+            remaining_requests = len(self.in_flight_requests)
+            if remaining_requests > 0:
+                logger.warning(f"Forcing shutdown with {remaining_requests} requests still in-flight")
+                
+                # Save state for persistence
+                await self.save_state_to_file()
+                
+                self.shutdown_stats["requests_lost"] += remaining_requests
+                return False
+            
+            self.shutdown_stats["requests_drained"] += drained_count
+            logger.info(f"Successfully drained {drained_count} requests")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Request draining failed: {e}")
+            return False
+    
+    async def _stop_workers(self, timeout: float) -> bool:
+        """Stop worker processes with timeout"""
+        # Call engine-specific worker shutdown if callback is registered
+        for callback in self.shutdown_callbacks:
+            if hasattr(callback, '__name__') and 'stop_workers' in callback.__name__:
+                try:
+                    return await callback(timeout)
+                except Exception as e:
+                    logger.error(f"Worker shutdown callback failed: {e}")
+                    return False
+        return True
+    
+    async def _clean_resources(self, timeout: float) -> bool:
+        """Clean up resources with timeout"""
+        # Call engine-specific resource cleanup if callback is registered
+        for callback in self.shutdown_callbacks:
+            if hasattr(callback, '__name__') and 'clean_resources' in callback.__name__:
+                try:
+                    return await callback(timeout)
+                except Exception as e:
+                    logger.error(f"Resource cleanup callback failed: {e}")
+                    return False
+        return True
+    
+    async def _shutdown_timeout_handler(self, timeout: float):
+        """Handle shutdown timeout by forcing shutdown"""
+        try:
+            await asyncio.sleep(timeout)
+            if self.state not in [TTSShutdownState.SHUTDOWN_COMPLETE, TTSShutdownState.FORCE_SHUTDOWN]:
+                logger.critical(f"Shutdown timeout reached ({timeout}s), forcing shutdown")
+                self.state = TTSShutdownState.FORCE_SHUTDOWN
+                self.force_shutdown_event.set()
+        except asyncio.CancelledError:
+            pass  # Timeout was cancelled, shutdown completed normally
+    
+    async def _wait_for_shutdown_complete(self, timeout: float) -> bool:
+        """Wait for shutdown to complete"""
+        try:
+            await asyncio.wait_for(self.shutdown_complete_event.wait(), timeout=timeout)
+            return self.state == TTSShutdownState.SHUTDOWN_COMPLETE
+        except asyncio.TimeoutError:
+            return False
+    
+    def _update_shutdown_stats(self):
+        """Update shutdown statistics"""
+        if self.shutdown_start_time:
+            shutdown_time = time.time() - self.shutdown_start_time
+            total_shutdowns = self.shutdown_stats["total_shutdowns"]
+            current_avg = self.shutdown_stats["average_shutdown_time"]
+            
+            # Update rolling average
+            self.shutdown_stats["average_shutdown_time"] = (
+                (current_avg * (total_shutdowns - 1) + shutdown_time) / total_shutdowns
+            )
+    
+    def add_shutdown_callback(self, callback: Callable):
+        """Add callback to be called during shutdown"""
+        self.shutdown_callbacks.append(callback)
+    
+    def register_in_flight_request(self, request: TTSRequest):
+        """Register a request as in-flight"""
+        self.in_flight_requests[request.request_id] = request
+    
+    def unregister_in_flight_request(self, request_id: str):
+        """Unregister a request from in-flight tracking"""
+        self.in_flight_requests.pop(request_id, None)
+    
+    def get_shutdown_status(self) -> Dict[str, Any]:
+        """Get current shutdown status"""
+        return {
+            "state": self.state.value,
+            "shutdown_time": time.time() - self.shutdown_start_time if self.shutdown_start_time else 0,
+            "shutdown_reason": self.shutdown_reason,
+            "in_flight_requests": len(self.in_flight_requests),
+            "statistics": self.shutdown_stats.copy()
+        }
+    
+    def is_shutting_down(self) -> bool:
+        """Check if shutdown is in progress"""
+        return self.state != TTSShutdownState.RUNNING
+    
+    def is_shutdown_complete(self) -> bool:
+        """Check if shutdown is complete"""
+        return self.state in [TTSShutdownState.SHUTDOWN_COMPLETE, TTSShutdownState.FORCE_SHUTDOWN]
+    
+    async def save_state_to_file(self, state_file: str = ".tts_shutdown_state.json"):
+        """Save current in-flight requests to file for state persistence"""
+        try:
+            import json
+            
+            # Prepare state data
+            state_data = {
+                "timestamp": time.time(),
+                "engine_name": self.engine_name,
+                "shutdown_state": self.state.value,
+                "shutdown_reason": self.shutdown_reason,
+                "in_flight_requests": []
+            }
+            
+            # Serialize in-flight requests
+            for request_id, request in self.in_flight_requests.items():
+                request_data = {
+                    "request_id": request_id,
+                    "text": request.text,
+                    "config": request.config,
+                    "priority": request.priority.value,
+                    "status": request.status.value,
+                    "created_at": request.created_at,
+                    "context": request.context
+                }
+                state_data["in_flight_requests"].append(request_data)
+            
+            # Write to file
+            with open(state_file, 'w') as f:
+                json.dump(state_data, f, indent=2)
+            
+            logger.info(f"Saved shutdown state to {state_file} ({len(self.in_flight_requests)} requests)")
+            
+        except Exception as e:
+            logger.error(f"Failed to save shutdown state: {e}")
+    
+    async def load_state_from_file(self, state_file: str = ".tts_shutdown_state.json") -> List[TTSRequest]:
+        """Load previously saved in-flight requests from file"""
+        try:
+            import json
+            from pathlib import Path
+            
+            if not Path(state_file).exists():
+                return []
+            
+            with open(state_file, 'r') as f:
+                state_data = json.load(f)
+            
+            # Reconstruct requests
+            recovered_requests = []
+            for request_data in state_data.get("in_flight_requests", []):
+                request = TTSRequest(
+                    text=request_data["text"],
+                    config=request_data["config"],
+                    priority=TTSPriority(request_data["priority"]),
+                    context=request_data.get("context", {})
+                )
+                request.request_id = request_data["request_id"]
+                request.status = TTSRequestStatus(request_data["status"])
+                request.created_at = request_data["created_at"]
+                recovered_requests.append(request)
+            
+            logger.info(f"Loaded {len(recovered_requests)} requests from {state_file}")
+            
+            # Clean up state file
+            Path(state_file).unlink()
+            
+            return recovered_requests
+            
+        except Exception as e:
+            logger.error(f"Failed to load shutdown state: {e}")
+            return []
+
+
 class AsyncTTSInterface(ABC):
     """
     Abstract interface for async TTS components
@@ -1038,13 +1354,14 @@ class AsyncTTSWorker(AsyncTTSInterface):
     Background worker for processing TTS requests with ThreadPoolExecutor infrastructure
     """
     
-    def __init__(self, worker_id: str, queue: AsyncTTSQueue, tts_client, max_thread_workers: int = 2, resource_manager: Optional[TTSResourceManager] = None, memory_manager: Optional[TTSMemoryManager] = None):
+    def __init__(self, worker_id: str, queue: AsyncTTSQueue, tts_client, max_thread_workers: int = 2, resource_manager: Optional[TTSResourceManager] = None, memory_manager: Optional[TTSMemoryManager] = None, engine_ref: Optional['AsyncTTSEngine'] = None):
         self.worker_id = worker_id
         self.queue = queue
         self.tts_client = tts_client
         self.max_thread_workers = max_thread_workers
         self.resource_manager = resource_manager
         self.memory_manager = memory_manager
+        self.engine_ref = engine_ref
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._processed_count = 0
@@ -1196,7 +1513,11 @@ class AsyncTTSWorker(AsyncTTSInterface):
                 
                 self._work_distribution_stats["pending_work"] -= 1
             
-            await self.queue.complete_request(request.request_id, success=True)
+            # Use engine's completion handler if available
+            if self.engine_ref:
+                await self.engine_ref._handle_request_completion(request.request_id, success=True)
+            else:
+                await self.queue.complete_request(request.request_id, success=True)
             self._processed_count += 1
             
         except Exception as e:
@@ -1211,7 +1532,11 @@ class AsyncTTSWorker(AsyncTTSInterface):
                 request.mark_retry()
                 await self.queue.enqueue(request)
             else:
-                await self.queue.complete_request(request.request_id, success=False)
+                # Use engine's completion handler if available
+                if self.engine_ref:
+                    await self.engine_ref._handle_request_completion(request.request_id, success=False)
+                else:
+                    await self.queue.complete_request(request.request_id, success=False)
             
             self._error_count += 1
             self._consecutive_errors += 1
@@ -1466,17 +1791,37 @@ class AsyncTTSEngine:
         }
         self.memory_manager = TTSMemoryManager(self._memory_config)
         
+        # Initialize shutdown manager
+        self.shutdown_manager = TTSShutdownManager("AsyncTTSEngine")
+        
         # Setup signal handlers
         self._setup_signal_handlers()
     
     def _setup_signal_handlers(self) -> None:
         """Setup graceful shutdown signal handlers"""
         def signal_handler(signum, frame):
-            logger.info(f"Received signal {signum}, initiating shutdown...")
-            asyncio.create_task(self.shutdown())
+            signal_names = {
+                signal.SIGTERM: "SIGTERM",
+                signal.SIGINT: "SIGINT"
+            }
+            signal_name = signal_names.get(signum, str(signum))
+            logger.info(f"Received signal {signal_name} ({signum}), initiating graceful shutdown...")
+            
+            # Use shutdown manager for graceful shutdown
+            asyncio.create_task(self.shutdown_manager.initiate_shutdown(
+                reason=f"signal_{signal_name.lower()}",
+                timeout=DEFAULT_SHUTDOWN_TIMEOUT
+            ))
         
-        signal.signal(signal.SIGTERM, signal_handler)
-        signal.signal(signal.SIGINT, signal_handler)
+        try:
+            signal.signal(signal.SIGTERM, signal_handler)
+            signal.signal(signal.SIGINT, signal_handler)
+            logger.debug("Signal handlers registered for SIGTERM and SIGINT")
+        except ValueError as e:
+            # Signal handlers can only be set in the main thread
+            logger.warning(f"Could not set signal handlers: {e}")
+        except Exception as e:
+            logger.error(f"Error setting up signal handlers: {e}")
     
     async def start(self) -> None:
         """Start the TTS engine"""
@@ -1490,6 +1835,10 @@ class AsyncTTSEngine:
         
         # Start memory management
         await self.memory_manager.start()
+        
+        # Register shutdown callbacks
+        self.shutdown_manager.add_shutdown_callback(self._shutdown_phase_stop_workers)
+        self.shutdown_manager.add_shutdown_callback(self._shutdown_phase_clean_resources)
         
         # Initialize TTS client
         await self._initialize_tts_client()
@@ -1505,13 +1854,17 @@ class AsyncTTSEngine:
                 self.tts_client,
                 max_thread_workers=2,  # Each worker gets 2 threads
                 resource_manager=self.resource_manager,
-                memory_manager=self.memory_manager
+                memory_manager=self.memory_manager,
+                engine_ref=self
             )
             await worker.start()
             self.workers.append(worker)
         
         # Start memory monitoring
         self._memory_monitor_task = asyncio.create_task(self._memory_monitor_loop())
+        
+        # Recover from previous shutdown if applicable
+        await self.recover_from_previous_shutdown()
         
         self._running = True
         logger.info(f"AsyncTTSEngine started with {len(self.workers)} workers")
@@ -1556,8 +1909,13 @@ class AsyncTTSEngine:
                 context={"source": "async_engine"}
             )
         
+        # Register request for shutdown tracking
+        self.shutdown_manager.register_in_flight_request(request)
+        
         success = await self.queue.enqueue(request)
         if not success:
+            # Remove from tracking if enqueue failed
+            self.shutdown_manager.unregister_in_flight_request(request.request_id)
             raise RuntimeError("TTS queue is full")
         
         return request.request_id
@@ -1578,45 +1936,129 @@ class AsyncTTSEngine:
         """Force memory cleanup and garbage collection"""
         await self.memory_manager.handle_memory_pressure()
     
-    async def shutdown(self, timeout: float = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
+    def get_shutdown_status(self) -> Dict[str, Any]:
+        """Get current shutdown status"""
+        return self.shutdown_manager.get_shutdown_status()
+    
+    def is_shutting_down(self) -> bool:
+        """Check if engine is in shutdown process"""
+        return self.shutdown_manager.is_shutting_down()
+    
+    async def _handle_request_completion(self, request_id: str, success: bool = True):
+        """Handle request completion and cleanup"""
+        # Remove from shutdown tracking
+        self.shutdown_manager.unregister_in_flight_request(request_id)
+        
+        # Mark as completed in queue
+        await self.queue.complete_request(request_id, success)
+    
+    async def recover_from_previous_shutdown(self):
+        """Recover and requeue requests from previous shutdown"""
+        try:
+            recovered_requests = await self.shutdown_manager.load_state_from_file()
+            
+            if recovered_requests:
+                logger.info(f"Recovering {len(recovered_requests)} requests from previous shutdown")
+                
+                for request in recovered_requests:
+                    # Reset status to pending for retry
+                    request.status = TTSRequestStatus.PENDING
+                    
+                    # Re-register for tracking
+                    self.shutdown_manager.register_in_flight_request(request)
+                    
+                    # Re-enqueue the request
+                    success = await self.queue.enqueue(request)
+                    if not success:
+                        logger.warning(f"Failed to requeue recovered request {request.request_id}")
+                        self.shutdown_manager.unregister_in_flight_request(request.request_id)
+                
+                logger.info(f"Successfully recovered {len(recovered_requests)} requests")
+            
+        except Exception as e:
+            logger.error(f"Failed to recover from previous shutdown: {e}")
+    
+    async def shutdown(self, timeout: float = DEFAULT_SHUTDOWN_TIMEOUT) -> bool:
         """
-        Gracefully shutdown the TTS engine
+        Gracefully shutdown the TTS engine using shutdown manager
         
         Args:
             timeout: Maximum time to wait for shutdown
+            
+        Returns:
+            bool: True if shutdown was successful, False if forced
         """
         if not self._running:
-            return
+            return True
         
-        logger.info("Shutting down AsyncTTSEngine...")
-        self._running = False
+        # Use shutdown manager for graceful shutdown
+        success = await self.shutdown_manager.initiate_shutdown(
+            reason="manual",
+            timeout=timeout
+        )
         
-        # Stop memory monitoring
-        if self._memory_monitor_task:
-            self._memory_monitor_task.cancel()
-        
-        # Stop workers
-        worker_tasks = [worker.stop() for worker in self.workers]
-        if worker_tasks:
-            await asyncio.wait_for(
-                asyncio.gather(*worker_tasks, return_exceptions=True),
-                timeout=timeout
-            )
-        
-        # Stop queue
-        await self.queue.stop()
-        
-        # Stop resource manager
-        await self.resource_manager.stop()
-        
-        # Stop memory management
-        await self.memory_manager.stop()
-        
-        # Cleanup
-        await self._cleanup_resources()
-        
-        self._shutdown_event.set()
-        logger.info("AsyncTTSEngine shutdown complete")
+        return success
+    
+    async def _shutdown_phase_stop_workers(self, timeout: float) -> bool:
+        """Stop workers during shutdown phase"""
+        try:
+            logger.info("Stopping TTS workers...")
+            
+            # Stop workers
+            worker_tasks = [worker.stop() for worker in self.workers]
+            if worker_tasks:
+                await asyncio.wait_for(
+                    asyncio.gather(*worker_tasks, return_exceptions=True),
+                    timeout=timeout
+                )
+            
+            self.workers.clear()
+            return True
+            
+        except asyncio.TimeoutError:
+            logger.error("Worker shutdown timed out")
+            return False
+        except Exception as e:
+            logger.error(f"Worker shutdown failed: {e}")
+            return False
+    
+    async def _shutdown_phase_clean_resources(self, timeout: float) -> bool:
+        """Clean resources during shutdown phase"""
+        try:
+            logger.info("Cleaning up TTS resources...")
+            
+            # Stop memory monitoring
+            if self._memory_monitor_task:
+                self._memory_monitor_task.cancel()
+                try:
+                    await asyncio.wait_for(self._memory_monitor_task, timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            
+            # Stop queue
+            await asyncio.wait_for(self.queue.stop(), timeout=timeout/4)
+            
+            # Stop resource manager
+            await asyncio.wait_for(self.resource_manager.stop(), timeout=timeout/4)
+            
+            # Stop memory management
+            await asyncio.wait_for(self.memory_manager.stop(), timeout=timeout/4)
+            
+            # Final cleanup
+            await asyncio.wait_for(self._cleanup_resources(), timeout=timeout/4)
+            
+            # Set engine state
+            self._running = False
+            self._shutdown_event.set()
+            
+            return True
+            
+        except asyncio.TimeoutError:
+            logger.error("Resource cleanup timed out")
+            return False
+        except Exception as e:
+            logger.error(f"Resource cleanup failed: {e}")
+            return False
     
     async def _initialize_tts_client(self) -> None:
         """Initialize TTS client"""

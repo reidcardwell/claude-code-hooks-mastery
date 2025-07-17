@@ -302,7 +302,7 @@
         "dependencies": [
           1
         ],
-        "status": "pending",
+        "status": "in-progress",
         "subtasks": [
           {
             "id": 1,
@@ -310,7 +310,7 @@
             "description": "Implement the core TTSConfig class with all required properties and type annotations",
             "dependencies": [],
             "details": "Create TTSConfig class in config_manager.py with properties: enabled (bool), max_words (int, default 20), voice_id (string), skip_tools (list), speak_confirmations (bool), volume (float 0-1), speed (float 0.5-2.0). Use dataclass or regular class with proper initialization. Include type hints and default values for all properties.",
-            "status": "pending",
+            "status": "done",
             "testStrategy": ""
           },
           {
@@ -383,7 +383,7 @@
         "dependencies": [
           4
         ],
-        "status": "pending",
+        "status": "done",
         "subtasks": [
           {
             "id": 1,
@@ -1259,11 +1259,171 @@
             "testStrategy": ""
           }
         ]
+      },
+      {
+        "id": 16,
+        "title": "Code Refactoring and Architecture Clean-up",
+        "description": "Refactor codebase for maintainability, performance, and clean architecture patterns. Break down monolithic files, implement proper separation of concerns, and ensure production-ready code quality.",
+        "details": "Comprehensive refactoring initiative to prepare codebase for production deployment. Key areas: 1) Break down monolithic files (async_tts_engine.py, hook implementations) into focused modules following single responsibility principle. 2) Implement proper separation of concerns with clear interfaces between TTS engine, audio processing, configuration management, and tool filtering. 3) Add comprehensive type hints throughout codebase using Python 3.8+ typing features. 4) Enhance docstrings with complete parameter descriptions, return types, and usage examples. 5) Implement performance optimizations: lazy loading, connection pooling, efficient data structures, memory management improvements. 6) Security hardening: input validation, secure configuration handling, API key protection, sanitization of user inputs. 7) Apply architecture patterns: dependency injection, factory pattern for audio backends, observer pattern for configuration changes. 8) Remove dead code and unused imports. 9) Optimize dependencies and remove unnecessary packages. 10) Update all documentation to reflect architectural changes. 11) Conduct final code review with automated linting, type checking, and security scanning.",
+        "testStrategy": "Execute comprehensive testing strategy: 1) Run full test suite after each refactoring phase to ensure no regressions. 2) Perform static analysis using mypy for type checking, flake8 for code quality, bandit for security vulnerabilities. 3) Benchmark performance improvements measuring TTS response times, memory usage, and startup performance. 4) Validate architecture patterns through integration tests and dependency injection verification. 5) Test cross-platform compatibility on all supported operating systems. 6) Conduct security audit of refactored code focusing on API key handling and input sanitization. 7) Perform code review using automated tools and manual inspection for maintainability, readability, and adherence to Python best practices. 8) Execute end-to-end testing to ensure all functionality remains intact post-refactoring. 9) Measure technical debt reduction through code complexity metrics and maintainability index improvements.",
+        "status": "pending",
+        "dependencies": [
+          5,
+          7,
+          8,
+          9,
+          11,
+          13,
+          15
+        ],
+        "priority": "medium",
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "File Structure Refactoring - Break Down Monolithic Files",
+            "description": "Decompose large monolithic files into focused modules following single responsibility principle",
+            "dependencies": [],
+            "details": "Analyze async_tts_engine.py and hook implementations to identify logical separation points. Create separate modules: tts_engine.py for core TTS functionality, audio_processor.py for audio handling, configuration_manager.py for config management, tool_filter.py for tool filtering logic. Each module should have a single, well-defined responsibility. Extract common utilities into shared modules. Maintain backward compatibility through proper imports.",
+            "status": "pending",
+            "testStrategy": "Verify all imports work correctly after file separation. Run existing tests to ensure no functionality is broken. Check that each new module has clear, focused responsibilities."
+          },
+          {
+            "id": 2,
+            "title": "Separation of Concerns - Implement Module Boundaries",
+            "description": "Establish clear interfaces and boundaries between TTS engine, audio processing, configuration, and tool filtering components",
+            "dependencies": [
+              1
+            ],
+            "details": "Define abstract base classes and interfaces for each major component. Create ITTSEngine interface for TTS implementations, IAudioProcessor for audio handling, IConfigurationManager for configuration management, IToolFilter for tool filtering. Implement dependency injection patterns to decouple components. Create clear API contracts between modules with well-defined input/output specifications.",
+            "status": "pending",
+            "testStrategy": "Test interface implementations work correctly. Verify components can be mocked for testing. Validate that changes in one module don't affect others unexpectedly."
+          },
+          {
+            "id": 3,
+            "title": "Type System Enhancement - Add Comprehensive Type Hints",
+            "description": "Add comprehensive type hints throughout codebase using Python 3.8+ typing features for better code clarity and IDE support",
+            "dependencies": [
+              1,
+              2
+            ],
+            "details": "Add type hints to all function signatures, class attributes, and variable declarations. Use modern typing features: Union, Optional, Literal, TypedDict, Protocol. Create custom type aliases for complex types. Ensure mypy compliance with strict mode enabled. Add generic types where appropriate for better type safety.",
+            "status": "pending",
+            "testStrategy": "Run mypy static type checking in strict mode. Verify all type hints are accurate and helpful. Test that IDE autocomplete and error detection work properly."
+          },
+          {
+            "id": 4,
+            "title": "Documentation Improvement - Enhanced Docstrings",
+            "description": "Enhance docstrings with complete parameter descriptions, return types, and usage examples",
+            "dependencies": [
+              3
+            ],
+            "details": "Update all docstrings to follow Google/NumPy style guide. Include detailed parameter descriptions with types, return value descriptions, raised exceptions, and usage examples. Add module-level docstrings explaining purpose and architecture. Create comprehensive API documentation. Include type information in docstrings that complements type hints.",
+            "status": "pending",
+            "testStrategy": "Generate API documentation and verify completeness. Check that docstrings are properly formatted and informative. Validate examples in docstrings are accurate."
+          },
+          {
+            "id": 5,
+            "title": "Performance Optimization - Code-Level Efficiency",
+            "description": "Implement performance optimizations including lazy loading, connection pooling, and efficient data structures",
+            "dependencies": [
+              2
+            ],
+            "details": "Implement lazy loading for TTS components to reduce startup time. Add connection pooling for API calls to reduce overhead. Optimize data structures using appropriate collections (deque, set, etc.). Implement caching strategies for frequently accessed data. Add memory management improvements to prevent leaks. Use async/await patterns efficiently.",
+            "status": "pending",
+            "testStrategy": "Benchmark performance before and after optimizations. Monitor memory usage patterns. Test startup time improvements. Validate that caching works correctly and doesn't cause stale data issues."
+          },
+          {
+            "id": 6,
+            "title": "Security Hardening - Input Validation and Protection",
+            "description": "Implement comprehensive security measures including input validation, secure configuration handling, and API key protection",
+            "dependencies": [
+              2,
+              3
+            ],
+            "details": "Add input validation for all user inputs and external data. Implement secure configuration handling with environment variable validation. Add API key protection through secure storage and access patterns. Sanitize user inputs to prevent injection attacks. Implement rate limiting and request validation. Add logging for security events without exposing sensitive data.",
+            "status": "pending",
+            "testStrategy": "Test input validation with various malformed inputs. Verify API keys are not logged or exposed. Test rate limiting behavior. Run security scanning tools to identify vulnerabilities."
+          },
+          {
+            "id": 7,
+            "title": "Architecture Pattern Implementation - Design Patterns",
+            "description": "Apply architecture patterns including dependency injection, factory pattern, and observer pattern",
+            "dependencies": [
+              2,
+              5
+            ],
+            "details": "Implement dependency injection container for managing component dependencies. Create factory pattern for audio backends to support multiple TTS providers. Add observer pattern for configuration changes to enable reactive updates. Implement strategy pattern for different TTS implementations. Create singleton pattern for shared resources like configuration manager.",
+            "status": "pending",
+            "testStrategy": "Test dependency injection works correctly with different configurations. Verify factory pattern creates appropriate implementations. Test observer pattern notifications work properly."
+          },
+          {
+            "id": 8,
+            "title": "Dead Code Elimination - Remove Unused Code",
+            "description": "Remove dead code, unused imports, and optimize codebase for maintainability",
+            "dependencies": [
+              1,
+              3
+            ],
+            "details": "Use static analysis tools to identify dead code and unused imports. Remove deprecated functions and obsolete code paths. Clean up commented-out code sections. Optimize imports to remove circular dependencies. Remove unused variables and parameters. Consolidate duplicate code into shared utilities.",
+            "status": "pending",
+            "testStrategy": "Run static analysis tools to verify no dead code remains. Ensure all imports are used. Test that functionality is preserved after cleanup. Verify no circular import issues exist."
+          },
+          {
+            "id": 9,
+            "title": "Dependency Optimization - Package Management",
+            "description": "Clean up and optimize package dependencies, removing unnecessary packages and updating requirements",
+            "dependencies": [
+              8
+            ],
+            "details": "Audit current dependencies for necessity and security. Remove unused packages from requirements. Update dependencies to latest stable versions. Implement dependency pinning for reproducible builds. Add security scanning for known vulnerabilities. Optimize package loading order for better performance.",
+            "status": "pending",
+            "testStrategy": "Test that application works with optimized dependencies. Verify security scanning passes. Check that build process is reproducible. Test installation on clean environment."
+          },
+          {
+            "id": 10,
+            "title": "Code Quality Assurance - Automated Analysis",
+            "description": "Implement automated linting, static analysis, and code review processes",
+            "dependencies": [
+              3,
+              6,
+              8
+            ],
+            "details": "Set up automated linting with flake8, black, and isort. Configure mypy for strict type checking. Add bandit for security analysis. Implement pre-commit hooks for code quality. Create code review checklists and automated quality gates. Add complexity analysis and maintainability metrics.",
+            "status": "pending",
+            "testStrategy": "Run all linting tools and verify they pass. Test pre-commit hooks work correctly. Validate code quality metrics meet standards. Ensure automated analysis catches common issues."
+          },
+          {
+            "id": 11,
+            "title": "Testing Infrastructure - Maintain Test Coverage",
+            "description": "Ensure all refactored code maintains comprehensive test coverage with updated test suites",
+            "dependencies": [
+              4,
+              7,
+              10
+            ],
+            "details": "Update existing tests to work with refactored code structure. Add new tests for newly created modules and interfaces. Ensure test coverage remains above 90%. Add integration tests for component interactions. Update test documentation and examples. Implement performance tests for optimized code paths.",
+            "status": "pending",
+            "testStrategy": "Run full test suite and verify all tests pass. Check test coverage metrics meet requirements. Test that new architecture components are properly tested. Validate performance test benchmarks."
+          },
+          {
+            "id": 12,
+            "title": "Final Quality Validation - Production Readiness",
+            "description": "Conduct comprehensive quality gates and production readiness checks",
+            "dependencies": [
+              9,
+              10,
+              11
+            ],
+            "details": "Perform final code review with focus on maintainability and production readiness. Run comprehensive test suite including unit, integration, and performance tests. Validate all documentation is complete and accurate. Check security compliance and vulnerability scanning. Verify deployment readiness and operational requirements. Conduct final architecture review.",
+            "status": "pending",
+            "testStrategy": "Execute full test suite with performance benchmarks. Run security scanning and compliance checks. Validate deployment procedures work correctly. Conduct final code review and approve production readiness."
+          }
+        ]
       }
     ],
     "metadata": {
       "created": "2025-07-15T19:44:16.184Z",
-      "updated": "2025-07-17T19:15:14.474Z",
+      "updated": "2025-07-17T19:55:14.889Z",
       "description": "Tasks for master context"
     }
   }

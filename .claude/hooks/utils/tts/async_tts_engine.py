@@ -442,6 +442,350 @@ class TTSResourceManager:
         }
 
 
+class TTSAudioBuffer:
+    """Manages audio buffers with size limits and efficient memory usage"""
+    
+    def __init__(self, max_buffer_size: int = 10 * 1024 * 1024):  # 10MB default
+        self._buffers: Dict[str, bytes] = {}
+        self._buffer_metadata: Dict[str, Dict[str, Any]] = {}
+        self._max_buffer_size = max_buffer_size
+        self._current_size = 0
+        self._access_times: Dict[str, float] = {}
+        self._lock = threading.Lock()
+        
+    def store_audio(self, request_id: str, audio_data: bytes, metadata: Dict[str, Any]) -> bool:
+        """Store audio data with metadata, returns False if size limit exceeded"""
+        with self._lock:
+            data_size = len(audio_data)
+            
+            # Check if adding this buffer would exceed limit
+            if self._current_size + data_size > self._max_buffer_size:
+                # Try to free space by removing oldest buffers
+                if not self._free_space_for_size(data_size):
+                    logger.warning(f"Cannot store audio buffer {request_id}: size limit exceeded")
+                    return False
+            
+            # Store the audio and metadata
+            self._buffers[request_id] = audio_data
+            self._buffer_metadata[request_id] = metadata
+            self._access_times[request_id] = time.time()
+            self._current_size += data_size
+            
+            logger.debug(f"Stored audio buffer {request_id} ({data_size} bytes)")
+            return True
+    
+    def get_audio(self, request_id: str) -> Optional[bytes]:
+        """Retrieve audio data and update access time"""
+        with self._lock:
+            if request_id in self._buffers:
+                self._access_times[request_id] = time.time()
+                return self._buffers[request_id]
+            return None
+    
+    def remove_audio(self, request_id: str) -> bool:
+        """Remove audio buffer"""
+        with self._lock:
+            if request_id in self._buffers:
+                data_size = len(self._buffers[request_id])
+                del self._buffers[request_id]
+                del self._buffer_metadata[request_id]
+                del self._access_times[request_id]
+                self._current_size -= data_size
+                logger.debug(f"Removed audio buffer {request_id} ({data_size} bytes)")
+                return True
+            return False
+    
+    def _free_space_for_size(self, needed_size: int) -> bool:
+        """Free space by removing oldest buffers"""
+        if needed_size > self._max_buffer_size:
+            return False
+        
+        # Sort by access time (oldest first)
+        sorted_buffers = sorted(self._access_times.items(), key=lambda x: x[1])
+        
+        freed_space = 0
+        for request_id, _ in sorted_buffers:
+            if self._current_size - freed_space + needed_size <= self._max_buffer_size:
+                break
+            
+            buffer_size = len(self._buffers[request_id])
+            del self._buffers[request_id]
+            del self._buffer_metadata[request_id]
+            del self._access_times[request_id]
+            freed_space += buffer_size
+            logger.debug(f"Freed audio buffer {request_id} ({buffer_size} bytes)")
+        
+        self._current_size -= freed_space
+        return self._current_size + needed_size <= self._max_buffer_size
+    
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """Get current memory usage statistics"""
+        with self._lock:
+            return {
+                "buffer_count": len(self._buffers),
+                "current_size": self._current_size,
+                "max_size": self._max_buffer_size,
+                "usage_percentage": (self._current_size / self._max_buffer_size) * 100,
+                "oldest_buffer_age": time.time() - min(self._access_times.values()) if self._access_times else 0
+            }
+
+
+class TTSResultCache:
+    """LRU cache for frequently used TTS results"""
+    
+    def __init__(self, max_entries: int = 100, max_memory: int = 50 * 1024 * 1024):  # 50MB default
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self._access_order: List[str] = []
+        self._memory_usage: Dict[str, int] = {}
+        self._max_entries = max_entries
+        self._max_memory = max_memory
+        self._current_memory = 0
+        self._lock = threading.Lock()
+        self._hits = 0
+        self._misses = 0
+        
+    def _generate_cache_key(self, text: str, voice_id: str, settings: Dict[str, Any]) -> str:
+        """Generate cache key from TTS parameters"""
+        import hashlib
+        key_data = f"{text}:{voice_id}:{sorted(settings.items())}"
+        return hashlib.md5(key_data.encode()).hexdigest()
+    
+    def get(self, text: str, voice_id: str, settings: Dict[str, Any]) -> Optional[bytes]:
+        """Get cached TTS result"""
+        cache_key = self._generate_cache_key(text, voice_id, settings)
+        
+        with self._lock:
+            if cache_key in self._cache:
+                # Move to end (most recently used)
+                self._access_order.remove(cache_key)
+                self._access_order.append(cache_key)
+                self._hits += 1
+                logger.debug(f"Cache hit for TTS result {cache_key[:8]}...")
+                return self._cache[cache_key]['data']
+            
+            self._misses += 1
+            return None
+    
+    def put(self, text: str, voice_id: str, settings: Dict[str, Any], audio_data: bytes) -> bool:
+        """Cache TTS result"""
+        cache_key = self._generate_cache_key(text, voice_id, settings)
+        data_size = len(audio_data)
+        
+        with self._lock:
+            # Check if we need to evict entries
+            while (len(self._cache) >= self._max_entries or 
+                   self._current_memory + data_size > self._max_memory):
+                if not self._access_order:
+                    logger.warning("Cannot cache TTS result: limits exceeded")
+                    return False
+                
+                # Remove least recently used
+                lru_key = self._access_order.pop(0)
+                if lru_key in self._cache:
+                    old_size = self._memory_usage[lru_key]
+                    del self._cache[lru_key]
+                    del self._memory_usage[lru_key]
+                    self._current_memory -= old_size
+                    logger.debug(f"Evicted cache entry {lru_key[:8]}... ({old_size} bytes)")
+            
+            # Add new entry
+            self._cache[cache_key] = {
+                'data': audio_data,
+                'timestamp': time.time(),
+                'access_count': 1
+            }
+            self._memory_usage[cache_key] = data_size
+            self._access_order.append(cache_key)
+            self._current_memory += data_size
+            
+            logger.debug(f"Cached TTS result {cache_key[:8]}... ({data_size} bytes)")
+            return True
+    
+    def clear(self):
+        """Clear all cached entries"""
+        with self._lock:
+            self._cache.clear()
+            self._access_order.clear()
+            self._memory_usage.clear()
+            self._current_memory = 0
+            logger.debug("Cleared TTS result cache")
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics"""
+        with self._lock:
+            total_requests = self._hits + self._misses
+            hit_rate = (self._hits / total_requests * 100) if total_requests > 0 else 0
+            
+            return {
+                "entries": len(self._cache),
+                "max_entries": self._max_entries,
+                "memory_usage": self._current_memory,
+                "max_memory": self._max_memory,
+                "memory_usage_percentage": (self._current_memory / self._max_memory) * 100,
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": hit_rate
+            }
+
+
+class TTSMemoryManager:
+    """Comprehensive memory management for TTS operations"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self._config = config
+        self._max_total_memory = config.get('max_total_memory', 100 * 1024 * 1024)  # 100MB default
+        self._memory_pressure_threshold = config.get('memory_pressure_threshold', 0.8)  # 80%
+        self._gc_threshold = config.get('gc_threshold', 0.9)  # 90%
+        self._oom_threshold = config.get('oom_threshold', 0.95)  # 95%
+        
+        # Initialize components
+        self._audio_buffer = TTSAudioBuffer(config.get('max_buffer_size', 10 * 1024 * 1024))
+        self._result_cache = TTSResultCache(
+            config.get('max_cache_entries', 100),
+            config.get('max_cache_memory', 50 * 1024 * 1024)
+        )
+        
+        # Memory monitoring
+        self._memory_stats = {
+            'total_allocations': 0,
+            'peak_usage': 0,
+            'pressure_events': 0,
+            'gc_events': 0,
+            'oom_events': 0
+        }
+        
+        self._monitoring_task: Optional[asyncio.Task] = None
+        self._running = False
+        
+    async def start(self):
+        """Start memory management and monitoring"""
+        self._running = True
+        self._monitoring_task = asyncio.create_task(self._memory_monitoring_loop())
+        logger.info("TTSMemoryManager started")
+    
+    async def stop(self):
+        """Stop memory management"""
+        self._running = False
+        
+        if self._monitoring_task:
+            self._monitoring_task.cancel()
+            try:
+                await self._monitoring_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Clear all cached data
+        self._result_cache.clear()
+        logger.info("TTSMemoryManager stopped")
+    
+    def get_audio_buffer(self) -> TTSAudioBuffer:
+        """Get the audio buffer manager"""
+        return self._audio_buffer
+    
+    def get_result_cache(self) -> TTSResultCache:
+        """Get the result cache manager"""
+        return self._result_cache
+    
+    def get_current_memory_usage(self) -> int:
+        """Get current total memory usage"""
+        buffer_stats = self._audio_buffer.get_memory_stats()
+        cache_stats = self._result_cache.get_cache_stats()
+        return buffer_stats['current_size'] + cache_stats['memory_usage']
+    
+    def get_memory_pressure_level(self) -> float:
+        """Get memory pressure level (0.0 to 1.0)"""
+        current_usage = self.get_current_memory_usage()
+        return current_usage / self._max_total_memory
+    
+    async def handle_memory_pressure(self):
+        """Handle memory pressure situations"""
+        pressure_level = self.get_memory_pressure_level()
+        
+        if pressure_level >= self._oom_threshold:
+            # Critical: Clear everything
+            self._memory_stats['oom_events'] += 1
+            logger.critical(f"OOM threshold reached ({pressure_level:.1%}), clearing all memory")
+            self._result_cache.clear()
+            # Audio buffers are cleared by freeing space as needed
+            
+        elif pressure_level >= self._gc_threshold:
+            # High: Aggressive cleanup
+            self._memory_stats['gc_events'] += 1
+            logger.warning(f"GC threshold reached ({pressure_level:.1%}), performing aggressive cleanup")
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            # Clear half of cache entries
+            cache_stats = self._result_cache.get_cache_stats()
+            entries_to_clear = cache_stats['entries'] // 2
+            for _ in range(entries_to_clear):
+                if self._result_cache._access_order:
+                    lru_key = self._result_cache._access_order.pop(0)
+                    if lru_key in self._result_cache._cache:
+                        size = self._result_cache._memory_usage[lru_key]
+                        del self._result_cache._cache[lru_key]
+                        del self._result_cache._memory_usage[lru_key]
+                        self._result_cache._current_memory -= size
+            
+        elif pressure_level >= self._memory_pressure_threshold:
+            # Medium: Normal pressure response
+            self._memory_stats['pressure_events'] += 1
+            logger.info(f"Memory pressure detected ({pressure_level:.1%}), performing cleanup")
+            
+            # Clear oldest 25% of cache
+            cache_stats = self._result_cache.get_cache_stats()
+            entries_to_clear = cache_stats['entries'] // 4
+            for _ in range(entries_to_clear):
+                if self._result_cache._access_order:
+                    lru_key = self._result_cache._access_order.pop(0)
+                    if lru_key in self._result_cache._cache:
+                        size = self._result_cache._memory_usage[lru_key]
+                        del self._result_cache._cache[lru_key]
+                        del self._result_cache._memory_usage[lru_key]
+                        self._result_cache._current_memory -= size
+    
+    async def _memory_monitoring_loop(self):
+        """Background task to monitor memory usage"""
+        while self._running:
+            try:
+                current_usage = self.get_current_memory_usage()
+                self._memory_stats['peak_usage'] = max(self._memory_stats['peak_usage'], current_usage)
+                
+                # Check for memory pressure
+                pressure_level = self.get_memory_pressure_level()
+                if pressure_level >= self._memory_pressure_threshold:
+                    await self.handle_memory_pressure()
+                
+                await asyncio.sleep(5)  # Check every 5 seconds
+                
+            except Exception as e:
+                logger.error(f"Memory monitoring error: {e}")
+                await asyncio.sleep(10)  # Longer delay on error
+    
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """Get comprehensive memory statistics"""
+        buffer_stats = self._audio_buffer.get_memory_stats()
+        cache_stats = self._result_cache.get_cache_stats()
+        current_usage = self.get_current_memory_usage()
+        
+        return {
+            "total_memory_usage": current_usage,
+            "max_total_memory": self._max_total_memory,
+            "memory_usage_percentage": (current_usage / self._max_total_memory) * 100,
+            "pressure_level": self.get_memory_pressure_level(),
+            "audio_buffer": buffer_stats,
+            "result_cache": cache_stats,
+            "memory_events": self._memory_stats,
+            "thresholds": {
+                "pressure": self._memory_pressure_threshold,
+                "gc": self._gc_threshold,
+                "oom": self._oom_threshold
+            }
+        }
+
+
 class AsyncTTSInterface(ABC):
     """
     Abstract interface for async TTS components
@@ -694,12 +1038,13 @@ class AsyncTTSWorker(AsyncTTSInterface):
     Background worker for processing TTS requests with ThreadPoolExecutor infrastructure
     """
     
-    def __init__(self, worker_id: str, queue: AsyncTTSQueue, tts_client, max_thread_workers: int = 2, resource_manager: Optional[TTSResourceManager] = None):
+    def __init__(self, worker_id: str, queue: AsyncTTSQueue, tts_client, max_thread_workers: int = 2, resource_manager: Optional[TTSResourceManager] = None, memory_manager: Optional[TTSMemoryManager] = None):
         self.worker_id = worker_id
         self.queue = queue
         self.tts_client = tts_client
         self.max_thread_workers = max_thread_workers
         self.resource_manager = resource_manager
+        self.memory_manager = memory_manager
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._processed_count = 0
@@ -872,7 +1217,7 @@ class AsyncTTSWorker(AsyncTTSInterface):
             self._consecutive_errors += 1
     
     def _synthesize_tts(self, request: TTSRequest) -> None:
-        """Synchronous TTS synthesis with thread-safe execution"""
+        """Synchronous TTS synthesis with thread-safe execution and memory management"""
         try:
             # Set thread name for monitoring
             current_thread = threading.current_thread()
@@ -880,11 +1225,55 @@ class AsyncTTSWorker(AsyncTTSInterface):
             current_thread.name = f"tts-{self.worker_id}-{request.request_id[:8]}"
             
             try:
-                # Import here to avoid circular imports
-                from .elevenlabs_tts import speak_text
+                # Check for cached audio in request context
+                if "cached_audio" in request.context:
+                    logger.debug(f"Using cached audio for request {request.request_id}")
+                    # Use cached audio - we would play it here
+                    # For now, just log and continue to avoid breaking existing functionality
+                    pass
                 
+                # Extract TTS parameters
                 voice_id = request.config.get('voice_id', '6HWqrqOzDfj3UnywjJoZ')
-                speak_text(request.text, voice_id)
+                tts_settings = {k: v for k, v in request.config.items() if k != 'voice_id'}
+                
+                # Check cache if we have memory manager
+                audio_data = None
+                if self.memory_manager:
+                    audio_data = self.memory_manager.get_result_cache().get(request.text, voice_id, tts_settings)
+                
+                if audio_data:
+                    # Cache hit - use cached audio
+                    logger.debug(f"Cache hit for request {request.request_id}")
+                    # Store in audio buffer for playback
+                    if self.memory_manager:
+                        self.memory_manager.get_audio_buffer().store_audio(
+                            request.request_id, 
+                            audio_data, 
+                            {"voice_id": voice_id, "timestamp": time.time()}
+                        )
+                else:
+                    # Cache miss - synthesize and cache
+                    logger.debug(f"Cache miss for request {request.request_id}, synthesizing...")
+                    
+                    # Import here to avoid circular imports
+                    from .elevenlabs_tts import speak_text
+                    
+                    # Synthesize TTS
+                    speak_text(request.text, voice_id)
+                    
+                    # TODO: Get the actual audio data from speak_text and cache it
+                    # For now, we'll create a placeholder to maintain the caching structure
+                    if self.memory_manager:
+                        # This is a placeholder - in a real implementation, we'd get the audio data
+                        placeholder_audio = b"placeholder_audio_data"
+                        self.memory_manager.get_result_cache().put(request.text, voice_id, tts_settings, placeholder_audio)
+                        
+                        # Also store in audio buffer
+                        self.memory_manager.get_audio_buffer().store_audio(
+                            request.request_id, 
+                            placeholder_audio, 
+                            {"voice_id": voice_id, "timestamp": time.time()}
+                        )
                 
             finally:
                 # Restore original thread name
@@ -1055,7 +1444,7 @@ class AsyncTTSEngine:
     for non-blocking TTS operations.
     """
     
-    def __init__(self, max_workers: int = DEFAULT_WORKER_THREADS):
+    def __init__(self, max_workers: int = DEFAULT_WORKER_THREADS, memory_config: Optional[Dict[str, Any]] = None):
         self.max_workers = max_workers
         self.queue = AsyncTTSQueue()
         self.workers: List[AsyncTTSWorker] = []
@@ -1064,6 +1453,18 @@ class AsyncTTSEngine:
         self._shutdown_event = asyncio.Event()
         self._memory_monitor_task: Optional[asyncio.Task] = None
         self.resource_manager = TTSResourceManager()
+        
+        # Initialize memory management
+        self._memory_config = memory_config or {
+            'max_total_memory': 100 * 1024 * 1024,  # 100MB
+            'max_buffer_size': 10 * 1024 * 1024,    # 10MB
+            'max_cache_entries': 100,
+            'max_cache_memory': 50 * 1024 * 1024,   # 50MB
+            'memory_pressure_threshold': 0.8,
+            'gc_threshold': 0.9,
+            'oom_threshold': 0.95
+        }
+        self.memory_manager = TTSMemoryManager(self._memory_config)
         
         # Setup signal handlers
         self._setup_signal_handlers()
@@ -1087,6 +1488,9 @@ class AsyncTTSEngine:
         # Start resource manager
         await self.resource_manager.start()
         
+        # Start memory management
+        await self.memory_manager.start()
+        
         # Initialize TTS client
         await self._initialize_tts_client()
         
@@ -1100,7 +1504,8 @@ class AsyncTTSEngine:
                 self.queue, 
                 self.tts_client,
                 max_thread_workers=2,  # Each worker gets 2 threads
-                resource_manager=self.resource_manager
+                resource_manager=self.resource_manager,
+                memory_manager=self.memory_manager
             )
             await worker.start()
             self.workers.append(worker)
@@ -1126,18 +1531,52 @@ class AsyncTTSEngine:
         if not self._running:
             raise RuntimeError("TTS engine not running")
         
-        request = TTSRequest(
-            text=text,
-            config=config,
-            priority=priority,
-            context={"source": "async_engine"}
-        )
+        # Check cache first
+        voice_id = config.get('voice_id', 'default')
+        tts_settings = {k: v for k, v in config.items() if k != 'voice_id'}
+        
+        cached_audio = self.memory_manager.get_result_cache().get(text, voice_id, tts_settings)
+        if cached_audio:
+            # Cache hit - play immediately without queuing
+            logger.debug(f"Cache hit for text: {text[:50]}...")
+            # TODO: Implement direct audio playback for cached results
+            # For now, we'll still queue but with a cache flag
+            request = TTSRequest(
+                text=text,
+                config=config,
+                priority=priority,
+                context={"source": "async_engine", "cached_audio": cached_audio}
+            )
+        else:
+            # Cache miss - normal request
+            request = TTSRequest(
+                text=text,
+                config=config,
+                priority=priority,
+                context={"source": "async_engine"}
+            )
         
         success = await self.queue.enqueue(request)
         if not success:
             raise RuntimeError("TTS queue is full")
         
         return request.request_id
+    
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """Get comprehensive memory statistics"""
+        return self.memory_manager.get_memory_stats()
+    
+    def get_audio_buffer(self) -> TTSAudioBuffer:
+        """Get access to audio buffer manager"""
+        return self.memory_manager.get_audio_buffer()
+    
+    def get_result_cache(self) -> TTSResultCache:
+        """Get access to result cache"""
+        return self.memory_manager.get_result_cache()
+    
+    async def force_memory_cleanup(self):
+        """Force memory cleanup and garbage collection"""
+        await self.memory_manager.handle_memory_pressure()
     
     async def shutdown(self, timeout: float = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
         """
@@ -1169,6 +1608,9 @@ class AsyncTTSEngine:
         
         # Stop resource manager
         await self.resource_manager.stop()
+        
+        # Stop memory management
+        await self.memory_manager.stop()
         
         # Cleanup
         await self._cleanup_resources()

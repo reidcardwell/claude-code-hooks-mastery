@@ -402,7 +402,7 @@
               1
             ],
             "details": "Create TTSQueue class in async_tts_engine.py. Implement semaphore-based concurrency limiting (max 3). Add queue data structure for pending requests. Implement enqueue/dequeue methods. Add queue size monitoring. Create queue overflow handling strategy.",
-            "status": "pending",
+            "status": "done",
             "testStrategy": ""
           },
           {
@@ -1263,7 +1263,7 @@
     ],
     "metadata": {
       "created": "2025-07-15T19:44:16.184Z",
-      "updated": "2025-07-17T15:41:22.732Z",
+      "updated": "2025-07-17T15:54:33.457Z",
       "description": "Tasks for master context"
     }
   }

@@ -55,10 +55,170 @@ import traceback
 import resource
 import sys
 import json
+from collections import defaultdict
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure thread-safe logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(thread)d] - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('.tts_engine.log')
+    ]
+)
 logger = logging.getLogger(__name__)
+
+
+class ThreadSafeLogger:
+    """Thread-safe logger wrapper to prevent race conditions in logging"""
+    
+    def __init__(self, name: str):
+        self.logger = logging.getLogger(name)
+        self._lock = threading.Lock()
+    
+    def debug(self, msg: str, *args, **kwargs) -> None:
+        with self._lock:
+            self.logger.debug(msg, *args, **kwargs)
+    
+    def info(self, msg: str, *args, **kwargs) -> None:
+        with self._lock:
+            self.logger.info(msg, *args, **kwargs)
+    
+    def warning(self, msg: str, *args, **kwargs) -> None:
+        with self._lock:
+            self.logger.warning(msg, *args, **kwargs)
+    
+    def error(self, msg: str, *args, **kwargs) -> None:
+        with self._lock:
+            self.logger.error(msg, *args, **kwargs)
+    
+    def critical(self, msg: str, *args, **kwargs) -> None:
+        with self._lock:
+            self.logger.critical(msg, *args, **kwargs)
+
+
+class ThreadSafeCounters:
+    """Thread-safe counter management for performance metrics"""
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._counters: Dict[str, Union[int, float]] = {}
+    
+    def increment(self, key: str, value: Union[int, float] = 1) -> Union[int, float]:
+        with self._lock:
+            self._counters[key] = self._counters.get(key, 0) + value
+            return self._counters[key]
+    
+    def decrement(self, key: str, value: Union[int, float] = 1) -> Union[int, float]:
+        with self._lock:
+            self._counters[key] = self._counters.get(key, 0) - value
+            return self._counters[key]
+    
+    def set(self, key: str, value: Union[int, float]) -> None:
+        with self._lock:
+            self._counters[key] = value
+    
+    def get(self, key: str) -> Union[int, float]:
+        with self._lock:
+            return self._counters.get(key, 0)
+    
+    def get_all(self) -> Dict[str, Union[int, float]]:
+        with self._lock:
+            return self._counters.copy()
+    
+    def reset(self) -> None:
+        with self._lock:
+            self._counters.clear()
+    
+    def atomic_max_update(self, key: str, value: Union[int, float]) -> Union[int, float]:
+        """Atomically update key to max of current value and new value"""
+        with self._lock:
+            current = self._counters.get(key, 0)
+            new_value = max(current, value)
+            self._counters[key] = new_value
+            return new_value
+
+
+class LockManager:
+    """Manages lock acquisition order to prevent deadlocks"""
+    
+    def __init__(self):
+        self._lock_order = {
+            'queue': 1,
+            'resource': 2,
+            'memory': 3,
+            'worker': 4,
+            'performance': 5,
+            'shutdown': 6
+        }
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._creation_lock = threading.Lock()
+    
+    def get_lock(self, name: str) -> asyncio.Lock:
+        """Get or create a lock with the given name"""
+        with self._creation_lock:
+            if name not in self._locks:
+                self._locks[name] = asyncio.Lock()
+            return self._locks[name]
+    
+    @asynccontextmanager
+    async def acquire_locks(self, *lock_names: str):
+        """Acquire multiple locks in consistent order to prevent deadlocks"""
+        if not lock_names:
+            yield
+            return
+        
+        # Sort by predefined order to prevent deadlocks
+        sorted_names = sorted(lock_names, key=lambda x: self._lock_order.get(x, 999))
+        locks = [self.get_lock(name) for name in sorted_names]
+        
+        acquired = []
+        try:
+            for lock in locks:
+                await lock.acquire()
+                acquired.append(lock)
+            yield
+        finally:
+            # Release in reverse order
+            for lock in reversed(acquired):
+                lock.release()
+
+
+class ThreadSafeSet:
+    """Thread-safe set operations"""
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._set: Set[Any] = set()
+    
+    def add(self, item: Any) -> None:
+        with self._lock:
+            self._set.add(item)
+    
+    def remove(self, item: Any) -> None:
+        with self._lock:
+            self._set.discard(item)
+    
+    def contains(self, item: Any) -> bool:
+        with self._lock:
+            return item in self._set
+    
+    def size(self) -> int:
+        with self._lock:
+            return len(self._set)
+    
+    def clear(self) -> None:
+        with self._lock:
+            self._set.clear()
+    
+    def copy(self) -> Set[Any]:
+        with self._lock:
+            return self._set.copy()
+
+
+# Create global instances
+safe_logger = ThreadSafeLogger(__name__)
+global_lock_manager = LockManager()
 
 # Constants
 DEFAULT_MAX_CONCURRENT_REQUESTS = 3
@@ -103,7 +263,7 @@ class TTSRequestStatus(Enum):
 @dataclass
 class TTSRequest:
     """
-    Represents a TTS request with priority and metadata
+    Thread-safe TTS request with priority and metadata
     """
     text: str
     config: Dict[str, Any]
@@ -116,6 +276,7 @@ class TTSRequest:
     context: Optional[Dict[str, Any]] = None
     _priority_score: float = field(default=0.0, init=False)
     _last_priority_boost: float = field(default=0.0, init=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     
     def __post_init__(self):
         # Calculate initial priority score
@@ -154,46 +315,65 @@ class TTSRequest:
         self._priority_score = base_score + age_factor + starvation_boost + recent_boost - retry_penalty
     
     def update_priority_score(self) -> None:
-        """Update priority score (called periodically to prevent starvation)"""
-        old_score = self._priority_score
-        self._calculate_priority_score()
-        
-        # Log significant priority changes
-        if abs(self._priority_score - old_score) > 100:
-            logger.debug(f"Priority score updated for {self.request_id}: {old_score:.1f} -> {self._priority_score:.1f}")
+        """Thread-safe update of priority score"""
+        with self._lock:
+            old_score = self._priority_score
+            self._calculate_priority_score()
+            
+            # Log significant priority changes
+            if abs(self._priority_score - old_score) > 100:
+                safe_logger.debug(f"Priority score updated for {self.request_id}: {old_score:.1f} -> {self._priority_score:.1f}")
     
     def get_priority_metrics(self) -> Dict[str, Any]:
-        """Get priority metrics for monitoring"""
-        current_time = time.time()
-        return {
-            "request_id": self.request_id,
-            "priority_level": self.priority.name,
-            "priority_score": self._priority_score,
-            "age_seconds": current_time - self.created_at,
-            "retry_count": self.retry_count,
-            "has_recent_boost": (current_time - self.created_at) < DEFAULT_PRIORITY_BOOST_THRESHOLD,
-            "last_boost_time": self._last_priority_boost
-        }
+        """Get priority metrics for monitoring - thread-safe"""
+        with self._lock:
+            current_time = time.time()
+            return {
+                "request_id": self.request_id,
+                "priority_level": self.priority.name,
+                "priority_score": self._priority_score,
+                "age_seconds": current_time - self.created_at,
+                "retry_count": self.retry_count,
+                "has_recent_boost": (current_time - self.created_at) < DEFAULT_PRIORITY_BOOST_THRESHOLD,
+                "last_boost_time": self._last_priority_boost
+            }
+    
+    def get_status_safe(self) -> TTSRequestStatus:
+        """Thread-safe status getter"""
+        with self._lock:
+            return self.status
+    
+    def set_status_safe(self, status: TTSRequestStatus) -> None:
+        """Thread-safe status setter"""
+        with self._lock:
+            self.status = status
+    
+    def get_priority_score_safe(self) -> float:
+        """Thread-safe priority score getter"""
+        with self._lock:
+            return self._priority_score
     
     def __lt__(self, other):
         """Priority queue comparison - higher priority score first"""
         # Update scores before comparison to ensure freshness
         self.update_priority_score()
         other.update_priority_score()
-        return self._priority_score > other._priority_score
+        return self.get_priority_score_safe() > other.get_priority_score_safe()
     
     def is_expired(self, max_age: float = 60.0) -> bool:
         """Check if request has expired"""
         return time.time() - self.created_at > max_age
     
     def can_retry(self) -> bool:
-        """Check if request can be retried"""
-        return self.retry_count < self.max_retries
+        """Thread-safe check if request can be retried"""
+        with self._lock:
+            return self.retry_count < self.max_retries
     
     def mark_retry(self):
-        """Mark request for retry"""
-        self.retry_count += 1
-        self.status = TTSRequestStatus.PENDING
+        """Thread-safe mark request for retry"""
+        with self._lock:
+            self.retry_count += 1
+            self.status = TTSRequestStatus.PENDING
 
 
 class TTSResourceType(Enum):
@@ -240,19 +420,16 @@ class TTSResource:
 
 
 class TTSResourceManager:
-    """Manages TTS resources and automatic cleanup"""
+    """Thread-safe TTS resource manager with automatic cleanup"""
     
     def __init__(self):
         self._resources: Dict[str, TTSResource] = {}
-        self._resource_locks: Dict[str, threading.Lock] = {}
         self._cleanup_task: Optional[asyncio.Task] = None
         self._leak_detection_task: Optional[asyncio.Task] = None
         self._memory_monitor_task: Optional[asyncio.Task] = None
         self._running = False
-        self._total_memory_usage = 0
-        self._peak_memory_usage = 0
-        self._cleanup_count = 0
-        self._leak_detection_count = 0
+        self._counters = ThreadSafeCounters()
+        self._main_lock = threading.Lock()  # Main lock for resource dictionary operations
         
     async def start(self):
         """Start the resource manager"""
@@ -260,7 +437,7 @@ class TTSResourceManager:
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         self._leak_detection_task = asyncio.create_task(self._leak_detection_loop())
         self._memory_monitor_task = asyncio.create_task(self._memory_monitor_loop())
-        logger.info("TTSResourceManager started")
+        safe_logger.info("TTSResourceManager started")
     
     async def stop(self):
         """Stop the resource manager and cleanup all resources"""
@@ -277,38 +454,47 @@ class TTSResourceManager:
         
         # Clean up all resources
         await self._cleanup_all_resources()
-        logger.info(f"TTSResourceManager stopped (cleaned up {self._cleanup_count} resources)")
+        cleanup_count = self._counters.get('cleanup_count')
+        safe_logger.info(f"TTSResourceManager stopped (cleaned up {cleanup_count} resources)")
     
     def register_resource(self, resource: TTSResource) -> str:
-        """Register a resource for cleanup tracking"""
+        """Thread-safe register a resource for cleanup tracking"""
         resource_id = resource.resource_id
-        self._resources[resource_id] = resource
-        self._resource_locks[resource_id] = threading.Lock()
-        self._total_memory_usage += resource.size_bytes
-        self._peak_memory_usage = max(self._peak_memory_usage, self._total_memory_usage)
-        logger.debug(f"Registered resource {resource_id} ({resource.resource_type.value})")
+        with self._main_lock:
+            self._resources[resource_id] = resource
+            
+        # Update counters atomically
+        self._counters.increment('total_memory_usage', resource.size_bytes)
+        self._counters.atomic_max_update('peak_memory_usage', self._counters.get('total_memory_usage'))
+        
+        safe_logger.debug(f"Registered resource {resource_id} ({resource.resource_type.value})")
         return resource_id
     
     def unregister_resource(self, resource_id: str) -> bool:
-        """Unregister and cleanup a resource"""
-        if resource_id in self._resources:
+        """Thread-safe unregister and cleanup a resource"""
+        with self._main_lock:
+            if resource_id not in self._resources:
+                return False
+            
             resource = self._resources[resource_id]
             resource.cleanup()
-            self._total_memory_usage -= resource.size_bytes
             del self._resources[resource_id]
-            del self._resource_locks[resource_id]
-            self._cleanup_count += 1
-            logger.debug(f"Unregistered resource {resource_id}")
-            return True
-        return False
+            
+        # Update counters atomically
+        self._counters.decrement('total_memory_usage', resource.size_bytes)
+        self._counters.increment('cleanup_count')
+        
+        safe_logger.debug(f"Unregistered resource {resource_id}")
+        return True
     
     def access_resource(self, resource_id: str) -> Optional[TTSResource]:
-        """Access a resource and update its access time"""
-        if resource_id in self._resources:
+        """Thread-safe access a resource and update its access time"""
+        with self._main_lock:
+            if resource_id not in self._resources:
+                return None
             resource = self._resources[resource_id]
             resource.update_access_time()
             return resource
-        return None
     
     @contextmanager
     def resource_context(self, resource_type: TTSResourceType, resource_ref: Any, 
@@ -340,19 +526,25 @@ class TTSResourceManager:
                 logger.error(f"Error in cleanup loop: {e}")
     
     async def _cleanup_stale_resources(self):
-        """Clean up stale resources"""
+        """Clean up stale resources - thread-safe"""
         stale_resources = []
         current_time = time.time()
         
-        for resource_id, resource in self._resources.items():
+        # Get snapshot of resources to check
+        with self._main_lock:
+            resources_snapshot = list(self._resources.items())
+        
+        # Check which resources are stale
+        for resource_id, resource in resources_snapshot:
             if resource.is_stale():
                 stale_resources.append(resource_id)
         
+        # Clean up stale resources
         for resource_id in stale_resources:
             self.unregister_resource(resource_id)
             
         if stale_resources:
-            logger.info(f"Cleaned up {len(stale_resources)} stale resources")
+            safe_logger.info(f"Cleaned up {len(stale_resources)} stale resources")
     
     async def _leak_detection_loop(self):
         """Background task for resource leak detection"""
@@ -363,23 +555,28 @@ class TTSResourceManager:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in leak detection loop: {e}")
+                safe_logger.error(f"Error in leak detection loop: {e}")
     
     async def _detect_leaks(self):
-        """Detect potential resource leaks"""
+        """Detect potential resource leaks - thread-safe"""
         current_time = time.time()
         long_lived_resources = []
         
-        for resource_id, resource in self._resources.items():
+        # Get snapshot of resources to check
+        with self._main_lock:
+            resources_snapshot = list(self._resources.items())
+        
+        # Check for long-lived resources
+        for resource_id, resource in resources_snapshot:
             age = current_time - resource.created_at
             if age > DEFAULT_STALE_REQUEST_AGE * 2:  # 10 minutes
                 long_lived_resources.append((resource_id, age, resource.resource_type))
         
         if long_lived_resources:
-            logger.warning(f"Potential resource leaks detected: {len(long_lived_resources)} long-lived resources")
+            safe_logger.warning(f"Potential resource leaks detected: {len(long_lived_resources)} long-lived resources")
             for resource_id, age, resource_type in long_lived_resources:
-                logger.warning(f"  - {resource_id} ({resource_type.value}): {age:.1f}s old")
-            self._leak_detection_count += len(long_lived_resources)
+                safe_logger.warning(f"  - {resource_id} ({resource_type.value}): {age:.1f}s old")
+            self._counters.increment('leak_detection_count', len(long_lived_resources))
     
     async def _memory_monitor_loop(self):
         """Background task for memory monitoring"""
@@ -436,20 +633,29 @@ class TTSResourceManager:
             self.unregister_resource(resource_id)
     
     def get_resource_stats(self) -> Dict[str, Any]:
-        """Get resource usage statistics"""
+        """Get resource usage statistics - thread-safe"""
         resource_types = {}
-        for resource in self._resources.values():
+        
+        # Get snapshot of resources
+        with self._main_lock:
+            resources_snapshot = list(self._resources.values())
+        
+        # Count resource types
+        for resource in resources_snapshot:
             resource_type = resource.resource_type.value
             if resource_type not in resource_types:
                 resource_types[resource_type] = 0
             resource_types[resource_type] += 1
         
+        # Get counter values atomically
+        counters = self._counters.get_all()
+        
         return {
-            "total_resources": len(self._resources),
-            "total_memory_usage": self._total_memory_usage,
-            "peak_memory_usage": self._peak_memory_usage,
-            "cleanup_count": self._cleanup_count,
-            "leak_detection_count": self._leak_detection_count,
+            "total_resources": len(resources_snapshot),
+            "total_memory_usage": counters.get('total_memory_usage', 0),
+            "peak_memory_usage": counters.get('peak_memory_usage', 0),
+            "cleanup_count": counters.get('cleanup_count', 0),
+            "leak_detection_count": counters.get('leak_detection_count', 0),
             "resource_types": resource_types
         }
 
@@ -1126,33 +1332,25 @@ class AsyncTTSInterface(ABC):
 
 class AsyncTTSQueue(AsyncTTSInterface):
     """
-    Async queue manager for TTS requests with priority and concurrency control
+    Thread-safe async queue manager for TTS requests with priority and concurrency control
     """
     
     def __init__(self, max_size: int = DEFAULT_QUEUE_SIZE):
         self.max_size = max_size
         self._queue: List[TTSRequest] = []
-        self._lock = asyncio.Lock()
-        self._not_empty = asyncio.Condition(self._lock)
-        self._not_full = asyncio.Condition(self._lock)
         self._active_requests: Dict[str, TTSRequest] = {}
         self._completed_requests: Dict[str, TTSRequest] = {}
         self._semaphore = asyncio.Semaphore(DEFAULT_MAX_CONCURRENT_REQUESTS)
         self._cleanup_task: Optional[asyncio.Task] = None
         self._priority_reorder_task: Optional[asyncio.Task] = None
-        self._priority_metrics: Dict[str, Any] = {
-            "total_requests": 0,
-            "priority_boosts": 0,
-            "starvation_prevented": 0,
-            "reorders_performed": 0,
-            "average_wait_time": 0.0
-        }
+        self._counters = ThreadSafeCounters()
+        self._main_lock = threading.Lock()  # Main lock for queue operations
         
     async def start(self) -> None:
         """Start the queue and background tasks"""
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         self._priority_reorder_task = asyncio.create_task(self._priority_reorder_loop())
-        logger.info("AsyncTTSQueue started")
+        safe_logger.info("AsyncTTSQueue started")
     
     async def stop(self) -> None:
         """Stop the queue and cleanup"""
@@ -1170,81 +1368,83 @@ class AsyncTTSQueue(AsyncTTSInterface):
             except asyncio.CancelledError:
                 pass
         
-        # Cancel all pending requests
-        async with self._lock:
+        # Cancel all pending requests - thread-safe
+        with self._main_lock:
             for request in self._queue:
-                request.status = TTSRequestStatus.CANCELLED
+                request.set_status_safe(TTSRequestStatus.CANCELLED)
             self._queue.clear()
         
-        logger.info("AsyncTTSQueue stopped")
+        safe_logger.info("AsyncTTSQueue stopped")
     
     async def enqueue(self, request: TTSRequest) -> bool:
         """
-        Add request to queue with priority handling
+        Add request to queue with priority handling - thread-safe
         
         Returns:
             bool: True if enqueued successfully, False if queue full
         """
-        async with self._not_full:
-            if len(self._queue) >= self.max_size:
-                # Remove oldest low-priority request if queue is full
-                await self._make_room()
+        async with global_lock_manager.acquire_locks('queue'):
+            with self._main_lock:
                 if len(self._queue) >= self.max_size:
-                    return False
-            
-            # Update metrics
-            self._priority_metrics["total_requests"] += 1
-            if request.priority == TTSPriority.HIGH and time.time() - request.created_at < DEFAULT_PRIORITY_BOOST_THRESHOLD:
-                self._priority_metrics["priority_boosts"] += 1
-            
-            # Insert in priority order
-            heapq.heappush(self._queue, request)
-            self._not_empty.notify()
-            
-            logger.debug(f"Enqueued request {request.request_id} with priority {request.priority}")
-            return True
+                    # Remove oldest low-priority request if queue is full
+                    if not self._make_room():
+                        return False
+                
+                # Update metrics atomically
+                self._counters.increment('total_requests')
+                if request.priority == TTSPriority.HIGH and time.time() - request.created_at < DEFAULT_PRIORITY_BOOST_THRESHOLD:
+                    self._counters.increment('priority_boosts')
+                
+                # Insert in priority order
+                heapq.heappush(self._queue, request)
+                
+                safe_logger.debug(f"Enqueued request {request.request_id} with priority {request.priority}")
+                return True
     
     async def dequeue(self) -> Optional[TTSRequest]:
         """
-        Remove and return highest priority request
+        Remove and return highest priority request - thread-safe
         
         Returns:
             TTSRequest or None if queue is empty
         """
-        async with self._not_empty:
-            while not self._queue:
-                await self._not_empty.wait()
-            
-            request = heapq.heappop(self._queue)
-            self._active_requests[request.request_id] = request
-            self._not_full.notify()
-            
-            logger.debug(f"Dequeued request {request.request_id}")
-            return request
+        async with global_lock_manager.acquire_locks('queue'):
+            with self._main_lock:
+                if not self._queue:
+                    return None
+                
+                request = heapq.heappop(self._queue)
+                self._active_requests[request.request_id] = request
+                
+                safe_logger.debug(f"Dequeued request {request.request_id}")
+                return request
     
     async def complete_request(self, request_id: str, success: bool = True) -> None:
-        """Mark request as completed"""
-        async with self._lock:
-            if request_id in self._active_requests:
-                request = self._active_requests.pop(request_id)
-                request.status = TTSRequestStatus.COMPLETED if success else TTSRequestStatus.FAILED
-                
-                # Update metrics
-                wait_time = time.time() - request.created_at
-                current_avg = self._priority_metrics["average_wait_time"]
-                total_requests = self._priority_metrics["total_requests"]
-                self._priority_metrics["average_wait_time"] = (
-                    (current_avg * (total_requests - 1) + wait_time) / total_requests
-                    if total_requests > 0 else wait_time
-                )
-                
-                self._completed_requests[request_id] = request
-                self._semaphore.release()
+        """Mark request as completed - thread-safe"""
+        async with global_lock_manager.acquire_locks('queue'):
+            with self._main_lock:
+                if request_id in self._active_requests:
+                    request = self._active_requests.pop(request_id)
+                    final_status = TTSRequestStatus.COMPLETED if success else TTSRequestStatus.FAILED
+                    request.set_status_safe(final_status)
+                    
+                    # Update metrics atomically
+                    wait_time = time.time() - request.created_at
+                    current_avg = self._counters.get('average_wait_time')
+                    total_requests = self._counters.get('total_requests')
+                    if total_requests > 0:
+                        new_avg = ((current_avg * (total_requests - 1) + wait_time) / total_requests)
+                        self._counters.set('average_wait_time', new_avg)
+                    else:
+                        self._counters.set('average_wait_time', wait_time)
+                    
+                    self._completed_requests[request_id] = request
+                    self._semaphore.release()
     
-    async def _make_room(self) -> None:
-        """Remove oldest low-priority request to make room"""
+    def _make_room(self) -> bool:
+        """Remove oldest low-priority request to make room - thread-safe"""
         if not self._queue:
-            return
+            return False
             
         # Find oldest low-priority request
         oldest_idx = -1
@@ -1257,9 +1457,12 @@ class AsyncTTSQueue(AsyncTTSInterface):
         
         if oldest_idx >= 0:
             removed = self._queue.pop(oldest_idx)
-            removed.status = TTSRequestStatus.CANCELLED
+            removed.set_status_safe(TTSRequestStatus.CANCELLED)
             heapq.heapify(self._queue)  # Restore heap property
-            logger.debug(f"Removed old request {removed.request_id} to make room")
+            safe_logger.debug(f"Removed old request {removed.request_id} to make room")
+            return True
+        
+        return False
     
     async def _cleanup_loop(self) -> None:
         """Background cleanup of expired requests"""
@@ -1273,17 +1476,18 @@ class AsyncTTSQueue(AsyncTTSInterface):
                 logger.error(f"Error in cleanup loop: {e}")
     
     async def _cleanup_expired(self) -> None:
-        """Remove expired requests"""
-        async with self._lock:
-            # Clean completed requests
-            expired_ids = [
-                req_id for req_id, request in self._completed_requests.items()
-                if request.is_expired()
-            ]
-            for req_id in expired_ids:
-                del self._completed_requests[req_id]
-            
-            # Clean expired pending requests
+        """Remove expired requests - thread-safe"""
+        async with global_lock_manager.acquire_locks('queue'):
+            with self._main_lock:
+                # Clean completed requests
+                expired_ids = [
+                    req_id for req_id, request in self._completed_requests.items()
+                    if request.is_expired()
+                ]
+                for req_id in expired_ids:
+                    del self._completed_requests[req_id]
+                
+                # Clean expired pending requests
             self._queue = [req for req in self._queue if not req.is_expired()]
             heapq.heapify(self._queue)
             
@@ -1302,52 +1506,54 @@ class AsyncTTSQueue(AsyncTTSInterface):
                 logger.error(f"Error in priority reorder loop: {e}")
     
     async def _reorder_queue(self) -> None:
-        """Reorder queue based on updated priority scores"""
-        async with self._lock:
-            if len(self._queue) <= 1:
-                return
-            
-            # Update priority scores for all requests
-            starvation_prevented = 0
-            for request in self._queue:
-                old_score = request._priority_score
-                request.update_priority_score()
+        """Reorder queue based on updated priority scores - thread-safe"""
+        async with global_lock_manager.acquire_locks('queue'):
+            with self._main_lock:
+                if len(self._queue) <= 1:
+                    return
                 
-                # Check if starvation prevention was triggered
-                if request._priority_score - old_score > 500:  # Significant boost
-                    starvation_prevented += 1
-            
-            # Reorder queue if priorities have changed significantly
-            if starvation_prevented > 0:
-                heapq.heapify(self._queue)
-                self._priority_metrics["starvation_prevented"] += starvation_prevented
-                self._priority_metrics["reorders_performed"] += 1
-                logger.debug(f"Reordered queue: prevented {starvation_prevented} starvation cases")
+                # Update priority scores for all requests
+                starvation_prevented = 0
+                for request in self._queue:
+                    old_score = request._priority_score
+                    request.update_priority_score()
+                    
+                    # Check if starvation prevention was triggered
+                    if request._priority_score - old_score > 500:  # Significant boost
+                        starvation_prevented += 1
+                
+                # Reorder queue if priorities have changed significantly
+                if starvation_prevented > 0:
+                    heapq.heapify(self._queue)
+                    self._priority_metrics["starvation_prevented"] += starvation_prevented
+                    self._priority_metrics["reorders_performed"] += 1
+                    safe_logger.debug(f"Reordered queue: prevented {starvation_prevented} starvation cases")
     
     async def health_check(self) -> Dict[str, Any]:
-        """Return queue health status"""
-        async with self._lock:
-            # Calculate priority distribution
-            priority_distribution = {p.name: 0 for p in TTSPriority}
-            for request in self._queue:
-                priority_distribution[request.priority.name] += 1
-            
-            # Get priority metrics for active requests
-            active_priorities = [
-                req.get_priority_metrics() for req in self._active_requests.values()
-            ]
-            
-            return {
-                "queue_size": len(self._queue),
-                "max_size": self.max_size,
-                "active_requests": len(self._active_requests),
-                "completed_requests": len(self._completed_requests),
-                "semaphore_value": self._semaphore._value,
-                "is_healthy": len(self._queue) < self.max_size * 0.8,
-                "priority_distribution": priority_distribution,
-                "priority_metrics": self._priority_metrics.copy(),
-                "active_request_priorities": active_priorities
-            }
+        """Return queue health status - thread-safe"""
+        async with global_lock_manager.acquire_locks('queue'):
+            with self._main_lock:
+                # Calculate priority distribution
+                priority_distribution = {p.name: 0 for p in TTSPriority}
+                for request in self._queue:
+                    priority_distribution[request.priority.name] += 1
+                
+                # Get priority metrics for active requests
+                active_priorities = [
+                    req.get_priority_metrics() for req in self._active_requests.values()
+                ]
+                
+                return {
+                    "queue_size": len(self._queue),
+                    "max_size": self.max_size,
+                    "active_requests": len(self._active_requests),
+                    "completed_requests": len(self._completed_requests),
+                    "semaphore_value": self._semaphore._value,
+                    "is_healthy": len(self._queue) < self.max_size * 0.8,
+                    "priority_distribution": priority_distribution,
+                    "priority_metrics": self._priority_metrics.copy(),
+                    "active_request_priorities": active_priorities
+                }
 
 
 class AsyncTTSWorker(AsyncTTSInterface):
@@ -1763,71 +1969,68 @@ async def async_tts_context(max_workers: int = DEFAULT_WORKER_THREADS):
 
 
 class TTSPerformanceMetrics:
-    """Performance metrics collection for TTS operations"""
+    """Thread-safe performance metrics collection for TTS operations"""
     
     def __init__(self):
-        self._metrics = {
-            'total_requests': 0,
-            'successful_requests': 0,
-            'failed_requests': 0,
-            'average_execution_time': 0.0,
-            'min_execution_time': float('inf'),
-            'max_execution_time': 0.0,
-            'total_execution_time': 0.0,
+        self._counters = ThreadSafeCounters()
+        self._samples_lock = threading.Lock()
+        self._samples = {
             'queue_depth_samples': [],
             'queue_latency_samples': [],
-            'concurrent_requests': 0,
-            'peak_concurrent_requests': 0,
             'throughput_samples': [],
             'bottleneck_events': [],
             'performance_alerts': []
         }
-        self._lock = threading.Lock()
         self._request_start_times: Dict[str, float] = {}
+        self._request_times_lock = threading.Lock()
         self._last_throughput_check = time.time()
         self._throughput_window = 60.0  # 1 minute window
         
+        # Initialize default counter values
+        self._counters.set('min_execution_time', float('inf'))
+        
     def record_request_start(self, request_id: str):
-        """Record when a request started processing"""
-        with self._lock:
-            self._request_start_times[request_id] = time.time()
-            self._metrics['total_requests'] += 1
-            self._metrics['concurrent_requests'] += 1
-            self._metrics['peak_concurrent_requests'] = max(
-                self._metrics['peak_concurrent_requests'],
-                self._metrics['concurrent_requests']
-            )
+        """Record when a request started processing - thread-safe"""
+        current_time = time.time()
+        
+        with self._request_times_lock:
+            self._request_start_times[request_id] = current_time
+        
+        # Update counters atomically
+        self._counters.increment('total_requests')
+        concurrent = self._counters.increment('concurrent_requests')
+        self._counters.atomic_max_update('peak_concurrent_requests', concurrent)
     
     def record_request_completion(self, request_id: str, success: bool = True):
-        """Record when a request completed"""
-        with self._lock:
-            if request_id in self._request_start_times:
-                execution_time = time.time() - self._request_start_times[request_id]
-                del self._request_start_times[request_id]
-                
-                # Update execution time metrics
-                self._metrics['total_execution_time'] += execution_time
-                self._metrics['min_execution_time'] = min(
-                    self._metrics['min_execution_time'], execution_time
-                )
-                self._metrics['max_execution_time'] = max(
-                    self._metrics['max_execution_time'], execution_time
-                )
-                
-                # Update average
-                completed_requests = self._metrics['successful_requests'] + self._metrics['failed_requests']
-                if completed_requests > 0:
-                    self._metrics['average_execution_time'] = (
-                        self._metrics['total_execution_time'] / completed_requests
-                    )
-                
-                # Update success/failure counts
-                if success:
-                    self._metrics['successful_requests'] += 1
-                else:
-                    self._metrics['failed_requests'] += 1
-                
-                self._metrics['concurrent_requests'] -= 1
+        """Record when a request completed - thread-safe"""
+        current_time = time.time()
+        
+        with self._request_times_lock:
+            if request_id not in self._request_start_times:
+                return
+            execution_time = current_time - self._request_start_times[request_id]
+            del self._request_start_times[request_id]
+        
+        # Update execution time metrics atomically
+        self._counters.increment('total_execution_time', execution_time)
+        current_min = self._counters.get('min_execution_time')
+        if execution_time < current_min:
+            self._counters.set('min_execution_time', execution_time)
+        self._counters.atomic_max_update('max_execution_time', execution_time)
+        
+        # Update success/failure counts
+        if success:
+            self._counters.increment('successful_requests')
+        else:
+            self._counters.increment('failed_requests')
+        
+        # Update average execution time
+        completed_requests = self._counters.get('successful_requests') + self._counters.get('failed_requests')
+        if completed_requests > 0:
+            total_time = self._counters.get('total_execution_time')
+            self._counters.set('average_execution_time', total_time / completed_requests)
+        
+        self._counters.decrement('concurrent_requests')
     
     def record_queue_depth(self, depth: int):
         """Record current queue depth"""

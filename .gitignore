@@ -125,6 +125,7 @@ dev-debug.log
 # Claude Code files
 docs/
 .taskmaster/
+.claude/commands/session*.md
 
 # Legacy entries
 .cursor

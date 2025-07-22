@@ -122,7 +122,11 @@ dev-debug.log
 # tasks.json
 # tasks/ 
 
-# Claude Code session files
-.claude/commands/session-git
+# Claude Code files
+.claude/
+.taskmaster/
+docs/
+
+# Legacy entries
 .cursor
 

@@ -123,9 +123,14 @@ dev-debug.log
 # tasks/ 
 
 # Claude Code files
-.claude/
-.taskmaster/
 docs/
+
+# Claude Code - exclude sensitive/temporary files but include core config
+.claude/settings.local.json
+.claude/sessions/
+.claude/**/*.log
+.claude/**/__pycache__/
+.claude/**/.DS_Store
 
 # Legacy entries
 .cursor

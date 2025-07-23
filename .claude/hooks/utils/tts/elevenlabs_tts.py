@@ -61,13 +61,22 @@ def main():
         print("🔊 Generating and playing...")
 
         try:
+            # Get voice configuration from environment
+            agent_voice = os.getenv('AGENT_VOICE', 'CORNELIUS').upper()
+            voice_key = f'VOICE_{agent_voice}'
+            voice_id = os.getenv(voice_key)
+            
+            if not voice_id:
+                print(f"❌ Error: Voice ID not found for {agent_voice}")
+                print(f"Please check that {voice_key} is defined in .env")
+                sys.exit(1)
+            
+            print(f"🎤 Using voice: {agent_voice} ({voice_id})")
+            
             # Generate and play audio directly
-            David = "jvcMcno3QtjOzGtfpjoI"
-            Cornelius = "6sFKzaJr574YWVu4UuJF"
-            Britney = "6HWqrqOzDfj3UnywjJoZ"
             audio = elevenlabs.text_to_speech.convert(
                 text=text,
-                voice_id = Britney,
+                voice_id=voice_id,
                 model_id="eleven_turbo_v2_5",
                 output_format="mp3_44100_128",
             )

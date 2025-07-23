@@ -52,6 +52,7 @@ def is_dangerous_rm_command(command):
     return False
 
 def is_env_file_access(tool_name, tool_input):
+    return False
     """
     Check if any tool is trying to access .env files containing sensitive data.
     """

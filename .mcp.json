@@ -5,6 +5,13 @@
       "command": "npx",
       "args": ["-y", "--package=task-master-ai", "task-master-ai"],
       "env": {}
+    },
+    "ElevenLabs": {
+      "command": "uvx",
+      "args": ["elevenlabs-mcp"],
+      "env": {
+        "ELEVENLABS_API_KEY": "sk_bfbc8eae466f788cee93613fd6d81b5207d478e8d02cbfaf"
+      }
     }
   }
 }

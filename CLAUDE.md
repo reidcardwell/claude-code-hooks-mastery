@@ -292,6 +292,17 @@ task-master models --set-fallback gpt-4o-mini
 - This CLAUDE.md file is automatically loaded for context
 - Use `task-master show <id>` to pull specific task context when needed
 
+### Work Completion Protocol
+
+**ALWAYS use the enhanced-work-summary agent when completing any task or significant work:**
+- Provide detailed context about what was actually accomplished (files changed, features implemented, problems solved)
+- Include specific technical details and outcomes in the agent prompt
+- Agent will create concise TTS summaries with contextual next steps
+- Agent provides contextual feedback and maintains development momentum
+
+**Example agent invocation:**
+"Completed git workflow automation: staged 7 files including new enhanced-work-summary agent, git-flow-automator agent, and performance-optimizer agent. Fixed syntax error in meta-agent.md and updated .mcp.json with ElevenLabs configuration. All changes committed and pushed to origin/main."
+
 ### Iterative Implementation
 
 1. `task-master show <subtask-id>` - Understand requirements
@@ -301,6 +312,7 @@ task-master models --set-fallback gpt-4o-mini
 5. Implement code following logged plan
 6. `task-master update-subtask --id=<id> --prompt="what worked/didn't work"` - Log progress
 7. `task-master set-status --id=<id> --status=done` - Complete task
+8. **Use enhanced-work-summary agent for audio completion summary and next steps**
 
 ### Complex Workflows with Checklists
 

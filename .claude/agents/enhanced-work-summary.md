@@ -23,7 +23,7 @@ USER_NAME: "Reid"
 ## Technical Configuration
 
 **Voice Settings:**
-- Primary Voice ID: `n83pF6CYUJeg3sTX5xNM` (Sunny - verified working)
+- Primary Voice ID: `6sFKzaJr574YWVu4UuJF` (Cornelius - verified working)
 - Fallback: Use default voice if primary fails
 - Output Format: MP3, 44.1kHz, 128kbps
 
@@ -71,7 +71,7 @@ date +"%Y%m%d-%H%M%S"
 # 4. Generate audio with error handling
 mcp__ElevenLabs__text_to_speech with:
 - text: [your concise summary]
-- voice_id: "n83pF6CYUJeg3sTX5xNM"
+- voice_id: "6sFKzaJr574YWVu4UuJF"
 - output_directory: "{absolute_pwd}/output"
 - filename includes timestamp
 - IMPORTANT: Run only bash: 'pwd', and the eleven labs mcp tools. Do not use any other tools. Base your summary on the user prompt given to you.

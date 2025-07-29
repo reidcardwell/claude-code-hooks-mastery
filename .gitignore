@@ -131,3 +131,6 @@ docs/
 # Legacy entries
 .cursor
 
+.mcp.json
+
+output

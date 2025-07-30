@@ -310,6 +310,10 @@ When these keywords/phrases are detected, ALWAYS use the specified sub-agent via
 - Keywords: "update task", "modify task", "enhance task", "expand task", "task hierarchy"
 - Action: Use Task tool with taskmaster-task-updater agent
 
+**Session Management:**
+- Keywords: "update session", "session update", "log progress", "record milestone", "track session"
+- Action: Use Task tool with session-manager agent
+
 ### Sub-Agent Usage Protocol
 1. **ALWAYS prioritize sub-agents over direct tool usage** for specialized operations
 2. **Before using Bash, Edit, or other direct tools**, check if a sub-agent exists for the task type

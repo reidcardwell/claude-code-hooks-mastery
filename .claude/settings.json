@@ -117,27 +117,6 @@
         ]
       }
     ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uv run .claude/hooks/user_prompt_submit.py --log-only"
-          }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uv run .claude/hooks/pre_compact.py"
-          }
-        ]
-      }
-    ],
     "SessionStart": [
       {
         "matcher": "",

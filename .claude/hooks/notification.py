@@ -86,7 +86,7 @@ def main():
     try:
         # Parse command line arguments
         parser = argparse.ArgumentParser()
-        parser.add_argument('--notify', action='store_true', help='Enable TTS notifications')
+        # parser.add_argument('--notify', action='store_true', help='Enable TTS notifications')
         args = parser.parse_args()
         
         # Read JSON input from stdin

@@ -112,8 +112,15 @@ def get_llm_completion_message():
     messages = get_completion_messages()
     return random.choice(messages)
 
+def call_enhanced_work_summary_agent():
+    """Call the enhanced-work-summary agent via Claude Code."""
+    # DISABLED: This was causing infinite loops by calling Claude Code from within hooks
+    # The enhanced-work-summary agent should be called manually by the user when needed
+    pass
+
+
 def announce_completion():
-    """Announce completion using the best available TTS service."""
+    """Announce completion using fallback TTS only (no agent calls to prevent loops)."""
     try:
         tts_script = get_tts_script_path()
         if not tts_script:
@@ -197,8 +204,8 @@ def main():
                 except Exception:
                     pass  # Fail silently
 
-        # Announce completion via TTS
-        # announce_completion()
+        # Announce completion via TTS (no agent calls to prevent infinite loops)
+        announce_completion()
 
         sys.exit(0)
 

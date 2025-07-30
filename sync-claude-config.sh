@@ -35,8 +35,9 @@ When these keywords/phrases are detected, ALWAYS use the specified sub-agent via
 - Action: Use Task tool with performance-optimizer agent
 
 **Work Completion:**
-- Keywords: "tts summary", "audio summary", "work complete", "finished task", "completed work"
+- Keywords: "tts summary", "audio summary"
 - Action: Use Task tool with enhanced-work-summary agent
+- Note: Only when explicitly requested by user
 
 **Complex Search/Analysis:**
 - Keywords: "search for", "find in codebase", "multi-step", "analyze system", "comprehensive search"

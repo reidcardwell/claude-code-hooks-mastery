@@ -298,8 +298,9 @@ When these keywords/phrases are detected, ALWAYS use the specified sub-agent via
 - Action: Use Task tool with performance-optimizer agent
 
 **Work Completion:**
-- Keywords: "tts summary", "audio summary", "work complete", "finished task", "completed work"
+- Keywords: "tts summary", "audio summary"
 - Action: Use Task tool with enhanced-work-summary agent
+- Note: Only when explicitly requested by user
 
 **Complex Search/Analysis:**
 - Keywords: "search for", "find in codebase", "multi-step", "analyze system", "comprehensive search"
@@ -325,14 +326,11 @@ When these keywords/phrases are detected, ALWAYS use the specified sub-agent via
 
 ### Work Completion Protocol
 
-**ALWAYS use the enhanced-work-summary agent when completing any task or significant work:**
-- Provide detailed context about what was actually accomplished (files changed, features implemented, problems solved)
-- Include specific technical details and outcomes in the agent prompt
-- Agent will create concise TTS summaries with contextual next steps
-- Agent provides contextual feedback and maintains development momentum
-
-**Example agent invocation:**
-"Completed git workflow automation: staged 7 files including new enhanced-work-summary agent, git-flow-automator agent, and performance-optimizer agent. Fixed syntax error in meta-agent.md and updated .mcp.json with ElevenLabs configuration. All changes committed and pushed to origin/main."
+**Work summary available on request:**
+- Enhanced-work-summary agent is available when user requests TTS feedback
+- Use keywords "tts summary" or "audio summary" to activate
+- Agent provides concise audio summaries with contextual next steps
+- Only invoke when explicitly requested by user
 
 ### Iterative Implementation
 
@@ -343,7 +341,6 @@ When these keywords/phrases are detected, ALWAYS use the specified sub-agent via
 5. Implement code following logged plan
 6. `task-master update-subtask --id=<id> --prompt="what worked/didn't work"` - Log progress
 7. `task-master set-status --id=<id> --status=done` - Complete task
-8. **Use enhanced-work-summary agent for audio completion summary and next steps**
 
 ### Complex Workflows with Checklists
 

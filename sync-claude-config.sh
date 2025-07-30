@@ -89,24 +89,33 @@ EXAMPLES:
 EOF
 }
 
-# Function to check if file should be ignored
-should_ignore() {
-    local filename="$1"
-    case "$filename" in
-        .DS_Store|Thumbs.db|desktop.ini|.Trashes|.Spotlight-V100|.fseventsd)
+
+# Function to check if file should be ignored (including log files and directories)
+should_ignore_file_or_directory() {
+    local filepath="$1"
+    case "$filepath" in
+        # Ignore any logs directories and their contents
+        */logs|*/logs/*)
             return 0
             ;;
-        *)
-            return 1
+        # Ignore backups directories and their contents
+        */.claude/backups|*/.claude/backups/*)
+            return 0
             ;;
-    esac
-}
-
-# Function to check if directory should be ignored
-should_ignore_directory() {
-    local dirpath="$1"
-    case "$dirpath" in
-        */.claude/hooks/logs|*/.claude/hooks/logs/*)
+        # Ignore Python cache directories and their contents
+        */__pycache__|*/__pycache__/*)
+            return 0
+            ;;
+        # Ignore individual log files
+        *.log)
+            return 0
+            ;;
+        # Ignore Python compiled files
+        *.pyc|*.pyo)
+            return 0
+            ;;
+        # Ignore OS files
+        */.DS_Store|*/Thumbs.db|*/desktop.ini|*/.Trashes|*/.Spotlight-V100|*/.fseventsd)
             return 0
             ;;
         *)
@@ -381,11 +390,15 @@ handle_file() {
                     print_color "$BLUE" "[DRY RUN] Would backup and overwrite: $target_file"
                 fi
             else
-                print_color "$YELLOW" "Skipping older file: ${source_file#$SCRIPT_DIR/}"
+                if [[ "$DRY_RUN" == "false" ]]; then
+                    print_color "$YELLOW" "Skipping older file: ${source_file#$SCRIPT_DIR/}"
+                fi
             fi
         else
             # Files are identical (same timestamp)
-            print_color "$BLUE" "Files identical: ${source_file#$SCRIPT_DIR/}"
+            if [[ "$DRY_RUN" == "false" ]]; then
+                print_color "$BLUE" "Files identical: ${source_file#$SCRIPT_DIR/}"
+            fi
         fi
     fi
 }
@@ -397,17 +410,10 @@ sync_directory() {
     
     print_color "$GREEN" "Syncing directory: $source_dir"
     
-    # Find all files in source directory
+    # Find all files in source directory, excluding ignored files and directories
     while IFS= read -r -d '' source_file; do
-        local filename="$(basename "$source_file")"
-        
-        # Skip ignored files
-        if should_ignore "$filename"; then
-            continue
-        fi
-        
-        # Skip ignored directories  
-        if should_ignore_directory "$source_file"; then
+        # Skip ignored files, log files, and files within ignored directories
+        if should_ignore_file_or_directory "$source_file"; then
             continue
         fi
         

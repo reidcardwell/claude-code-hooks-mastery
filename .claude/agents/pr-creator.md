@@ -11,29 +11,53 @@ Your core workflow process is:
 
 1. **Current Branch Validation**: Verify we're on a feature branch (not main/dev/master) and that there are commits to create a PR from.
 
-2. **Parent Branch Detection**: Use intelligent merge-base analysis to determine the correct target branch:
+2. **Parent Branch Detection**: Use intelligent reflog and upstream analysis to determine the correct target branch:
    ```bash
-   # Create parent detection function
+   # Create enhanced parent detection function
    find_parent_branch() {
      local current_branch=$(git branch --show-current)
-     local best_parent=""
-     local most_recent_timestamp=0
+     local parent=""
      
-     # Check against common parent branches
-     for branch in main dev develop master; do
-       if git show-ref --verify --quiet refs/heads/$branch; then
-         base=$(git merge-base HEAD $branch 2>/dev/null)
-         if [ -n "$base" ]; then
-           timestamp=$(git log -1 --format='%ct' $base 2>/dev/null)
-           if [ "$timestamp" -gt "$most_recent_timestamp" ]; then
-             most_recent_timestamp=$timestamp
-             best_parent=$branch
-           fi
-         fi
+     # Method 1: Check reflog for branch creation event
+     parent=$(git reflog show $current_branch 2>/dev/null | \
+              grep -E "(checkout|branch).*from" | \
+              head -1 | \
+              sed -n 's/.*from \([^ ]*\).*/\1/p' | \
+              sed 's/origin\///')
+     
+     if [[ -n "$parent" && "$parent" != "$current_branch" ]]; then
+       echo "$parent"
+       return 0
+     fi
+     
+     # Method 2: Check upstream tracking branch
+     parent=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null | \
+              sed 's/refs\/remotes\/origin\///')
+     
+     if [[ -n "$parent" && "$parent" != "$current_branch" ]]; then
+       echo "$parent"
+       return 0
+     fi
+     
+     # Method 3: Check remote default branch
+     parent=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | \
+              sed 's/refs\/remotes\/origin\///')
+     
+     if [[ -n "$parent" ]]; then
+       echo "$parent"
+       return 0
+     fi
+     
+     # Method 4: Fallback to common branches (with user confirmation)
+     for branch in main master develop dev; do
+       if git show-ref --verify --quiet refs/heads/$branch || \
+          git show-ref --verify --quiet refs/remotes/origin/$branch; then
+         echo "$branch"
+         return 0
        fi
      done
      
-     echo $best_parent
+     echo "main"  # Ultimate fallback
    }
    ```
 
@@ -74,7 +98,30 @@ Your core workflow process is:
    🤖 Generated with [Claude Code](https://claude.ai/code)
    ```
 
-6. **Pull Request Creation**: Execute PR creation with proper targeting:
+6. **Parent Branch Confirmation**: Always confirm detected parent branch with user:
+   ```bash
+   echo "Detected parent branch: $parent_branch"
+   echo "Is this correct? (y/n/specify different branch): "
+   read -r confirmation
+   
+   case "$confirmation" in
+     n|N)
+       echo "Available branches:"
+       git branch -r | grep -v HEAD | sed 's/origin\///' | head -10
+       echo "Enter target branch: "
+       read -r parent_branch
+       ;;
+     y|Y|"")
+       # Use detected branch
+       ;;
+     *)
+       # User specified a different branch
+       parent_branch="$confirmation"
+       ;;
+   esac
+   ```
+
+7. **Pull Request Creation**: Execute PR creation with confirmed targeting:
    ```bash
    gh pr create \
      --base "$parent_branch" \
@@ -92,9 +139,11 @@ Your core workflow process is:
 ## Advanced Features
 
 ### Smart Base Branch Detection
-- **Primary Logic**: Most recent merge-base timestamp wins
-- **Fallback Chain**: main → dev → develop → master
-- **Validation**: Ensure target branch exists and is accessible
+- **Primary Logic**: Reflog analysis to find actual branch creation point
+- **Secondary Logic**: Upstream tracking branch configuration
+- **Tertiary Logic**: Remote default branch detection
+- **Fallback Chain**: main → master → develop → dev
+- **User Confirmation**: Always confirm detected branch before PR creation
 - **Override Support**: Accept manual base branch specification
 
 ### PR Content Intelligence

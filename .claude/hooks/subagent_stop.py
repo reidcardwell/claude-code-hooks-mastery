@@ -91,7 +91,9 @@ def main():
         stop_hook_active = input_data.get("stop_hook_active", False)
 
         # Ensure log directory exists
-        log_dir = os.path.join(os.getcwd(), "logs")
+        # Ensure log directory exists in .claude/hooks/logs
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        log_dir = os.path.join(script_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "subagent_stop.json")
 

@@ -1,11 +1,12 @@
-# Git Workflow Only
+# Git Workflow with Summary Display
 
-Run git workflow for staging, commit, and push operations.
+Run complete git workflow and display detailed results to the user.
 
 ## Steps
 
 1. **Execute Git Workflow**: Run git-flow-automator agent to handle staging, commit, and push
-2. **Manual Summary Option**: User can manually request TTS summary if desired using "tts summary"
+2. **Extract Key Information**: Parse the agent response for important details
+3. **Display Results**: Show commit hash, message, files changed, and push status to user
 
 ## Usage
 
@@ -15,23 +16,37 @@ Run git workflow for staging, commit, and push operations.
 
 ## Implementation
 
-Execute git workflow only:
+Execute the following sequence:
 
-### Git Operations
+### Step 1: Git Operations
 Use the Task tool to run git-flow-automator:
 ```
 Task(description="Execute git workflow", prompt="Update git", subagent_type="git-flow-automator")
 ```
 
-## Optional Manual TTS Summary
+### Step 2: Information Extraction and Display
+After the git-flow-automator completes, extract and display the following information:
 
-If you want audio feedback after git operations, manually use:
-- Say "tts summary" to activate enhanced-work-summary agent
-- Provide context about what was committed
-- Agent will generate audio feedback
+**Required Information to Display:**
+- Files that were staged and committed
+- Commit hash (short form)
+- Full commit message
+- Push status and target branch
+- Any warnings or important notes
+
+**Display Format:**
+```
+## Git Workflow Complete
+
+**Files Changed**: [list of modified files]
+**Commit Hash**: `[short hash]`
+**Commit Message**: "[full commit message]"
+**Push Status**: [success/failure with branch info]
+**Additional Notes**: [any warnings or important info]
+```
 
 ## Notes
 
-- This command executes git workflow only
-- TTS summary is available on manual request
-- Prevents automatic loops while maintaining functionality
+- This command executes git workflow and displays detailed results
+- Information is extracted from git-flow-automator agent response
+- Provides full visibility into git operations

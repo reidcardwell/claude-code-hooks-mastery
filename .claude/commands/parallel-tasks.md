@@ -89,7 +89,19 @@ Task(description="Update Taskmaster status",
      subagent_type="taskmaster-task-updater")
 ```
 
-### Phase 6: Comprehensive Session Update
+### Phase 6: Pull Request Creation
+**Create PR for the completed work:**
+```
+Task(description="Create pull request", 
+     prompt="Create pull request for parallel task execution results:
+     - Multiple tasks completed: [successful_task_titles]
+     - Branch work ready for review
+     - Auto-detect parent branch and create appropriately targeted PR
+     - Include task breakdown and implementation summary in PR description", 
+     subagent_type="pr-creator")
+```
+
+### Phase 7: Comprehensive Session Update
 **Final step:**
 ```
 Task(description="Update development session", 
@@ -100,6 +112,7 @@ Task(description="Update development session",
      - Skipped due to dependencies: [skipped_tasks]
      - Key implementations: [summary of what was built]
      - Single comprehensive git commit created
+     - Pull request created: [PR_URL]
      - Auto-detected tests run: [test_results]", 
      subagent_type="session-manager")
 ```
@@ -162,6 +175,7 @@ Wave 1: Tasks 1.1, 2.1 (parallel)
 Wave 2: Tasks 1.2, 2.3 (parallel, after 1.1 completed)
 
 **Git Commit**: 1 comprehensive commit with detailed breakdown
+**Pull Request**: Auto-created with intelligent parent targeting
 **Session Updated**: Comprehensive progress logged
 ```
 
@@ -190,6 +204,8 @@ During execution, the command provides real-time feedback:
 🔄 Committing all changes...
 ✅ Git commit successful: 1d4f2a8
 📝 Updating Taskmaster status...
+🔗 Creating pull request...
+✅ Pull request created: #42 targeting dev branch
 📊 Session updated with comprehensive results
 ```
 

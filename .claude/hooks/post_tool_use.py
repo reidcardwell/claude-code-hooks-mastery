@@ -13,8 +13,9 @@ def main():
         # Read JSON input from stdin
         input_data = json.load(sys.stdin)
         
-        # Ensure log directory exists
-        log_dir = Path.cwd() / 'logs'
+        # Ensure log directory exists in .claude/hooks/logs
+        script_dir = Path(__file__).parent
+        log_dir = script_dir / 'logs'
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / 'post_tool_use.json'
         

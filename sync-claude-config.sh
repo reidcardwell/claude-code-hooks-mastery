@@ -14,14 +14,17 @@ NC='\033[0m' # No Color
 
 # Global variables
 DRY_RUN=false
+SKIP_OLDER=false
 TARGET_DIR=""
 BACKUP_DIR=""
 APPLY_TO_ALL=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIRS=("agents" "hooks" "commands")
 
-# Sub-agent trigger rules content to inject
-SUB_AGENT_RULES='## Sub-Agent Trigger Rules
+# Function to get sub-agent trigger rules content
+get_sub_agent_rules() {
+    cat << 'EOF'
+## Sub-Agent Trigger Rules
 
 ### Automatic Sub-Agent Activation
 When these keywords/phrases are detected, ALWAYS use the specified sub-agent via the Task tool:
@@ -51,12 +54,17 @@ When these keywords/phrases are detected, ALWAYS use the specified sub-agent via
 - Keywords: "update session", "session update", "log progress", "record milestone", "track session"
 - Action: Use Task tool with session-manager agent
 
+**Pull Request Creation:**
+- Keywords: "create PR", "pull request", "open PR", "submit for review", "create pull request"
+- Action: Use Task tool with pr-creator agent
+
 ### Sub-Agent Usage Protocol
 1. **ALWAYS prioritize sub-agents over direct tool usage** for specialized operations
 2. **Before using Bash, Edit, or other direct tools**, check if a sub-agent exists for the task type
 3. **Default to Task tool** when the operation matches any trigger keywords above
 4. **Sub-agents provide enhanced capabilities** through specialized knowledge and tool coordination
-'
+EOF
+}
 
 # Function to print colored output
 print_color() {
@@ -73,8 +81,9 @@ Usage: $0 [OPTIONS] TARGET_DIRECTORY
 Synchronizes .claude directories (agents, hooks, commands) from this project to TARGET_DIRECTORY.
 
 OPTIONS:
-    -h, --help      Show this help message
-    -n, --dry-run   Show what would be done without making changes
+    -h, --help         Show this help message
+    -n, --dry-run      Show what would be done without making changes
+    -s, --skip-older   Automatically skip older source files without prompting
 
 BEHAVIOR:
     - Missing files: Copied from source to target
@@ -148,7 +157,7 @@ Before executing any directive:
 4. Write all code as efficiently and with as few lines as possible.
 5. If you're unsure about any aspect or if the request lacks necessary information, say "I don't have enough information to confidently assess this."
 
-$SUB_AGENT_RULES
+$(get_sub_agent_rules)
 
 ## Personal Notes
 
@@ -165,10 +174,14 @@ EOF
 merge_sub_agent_rules() {
     local target_file="$1"
     local temp_file="${target_file}.tmp"
+    local rules_file="${target_file}.rules"
     
     print_color "$GREEN" "Merging sub-agent rules into existing CLAUDE.md"
     
     if [[ "$DRY_RUN" == "false" ]]; then
+        # Create temporary file with rules content
+        get_sub_agent_rules > "$rules_file"
+        
         # Check if sub-agent rules already exist
         if grep -q "## Sub-Agent Trigger Rules" "$target_file"; then
             print_color "$YELLOW" "Sub-agent rules section already exists, updating..."
@@ -181,10 +194,13 @@ merge_sub_agent_rules() {
             ' "$target_file" > "$temp_file"
             
             # Add updated sub-agent rules before the first ## section after project overview
-            awk -v rules="$SUB_AGENT_RULES" '
+            awk '
                 BEGIN { added=0 }
                 /^## / && !added && !/^## Project Overview/ && !/^## Sub-Agent Trigger Rules/ {
-                    print rules
+                    while ((getline line < "'"$rules_file"'") > 0) {
+                        print line
+                    }
+                    close("'"$rules_file"'")
                     print ""
                     added=1
                 }
@@ -196,10 +212,13 @@ merge_sub_agent_rules() {
             print_color "$YELLOW" "Adding sub-agent rules section..."
             
             # Find insertion point (after Project Overview or at beginning)
-            awk -v rules="$SUB_AGENT_RULES" '
+            awk '
                 BEGIN { added=0 }
                 /^## / && !added && !/^## Project Overview/ {
-                    print rules
+                    while ((getline line < "'"$rules_file"'") > 0) {
+                        print line
+                    }
+                    close("'"$rules_file"'")
                     print ""
                     added=1
                 }
@@ -207,13 +226,19 @@ merge_sub_agent_rules() {
                 END {
                     if (!added) {
                         print ""
-                        print rules
+                        while ((getline line < "'"$rules_file"'") > 0) {
+                            print line
+                        }
+                        close("'"$rules_file"'")
                     }
                 }
             ' "$target_file" > "$temp_file"
             
             mv "$temp_file" "$target_file"
         fi
+        
+        # Clean up temporary rules file
+        rm "$rules_file"
         
         print_color "$GREEN" "Updated: $target_file"
     else
@@ -293,8 +318,10 @@ prompt_user() {
     local target_time="$4"
     
     # If we have a global choice, apply it
-    if [[ -n "$APPLY_TO_ALL" ]]; then
-        return
+    if [[ "$APPLY_TO_ALL" == "overwrite" ]]; then
+        return 0
+    elif [[ "$APPLY_TO_ALL" == "skip" ]]; then
+        return 1
     fi
     
     echo
@@ -308,11 +335,9 @@ prompt_user() {
         read -p "Action: (o)verwrite, (s)kip, (d)iff, (a)ll overwrite, (A)ll skip? [s]: " choice
         case "${choice:-s}" in
             o|O)
-                APPLY_TO_ALL=""
                 return 0
                 ;;
             s|S)
-                APPLY_TO_ALL=""
                 return 1
                 ;;
             d|D)
@@ -368,17 +393,20 @@ handle_file() {
                 print_color "$BLUE" "[DRY RUN] Would backup and overwrite: $target_file"
             fi
         elif [[ "$source_time" -lt "$target_time" ]]; then
-            # Source is older - prompt user
+            # Source is older - handle based on flags and settings
             local should_overwrite=false
             
             if [[ "$APPLY_TO_ALL" == "overwrite" ]]; then
                 should_overwrite=true
-            elif [[ "$APPLY_TO_ALL" == "skip" ]]; then
+            elif [[ "$APPLY_TO_ALL" == "skip" ]] || [[ "$SKIP_OLDER" == "true" ]]; then
                 should_overwrite=false
             elif [[ "$DRY_RUN" == "false" ]]; then
                 if prompt_user "$source_file" "$target_file" "$source_time" "$target_time"; then
                     should_overwrite=true
                 fi
+            else
+                # In dry-run mode, default to skip older files
+                should_overwrite=false
             fi
             
             if [[ "$should_overwrite" == "true" ]]; then
@@ -473,6 +501,10 @@ main() {
                 ;;
             -n|--dry-run)
                 DRY_RUN=true
+                shift
+                ;;
+            -s|--skip-older)
+                SKIP_OLDER=true
                 shift
                 ;;
             -*)

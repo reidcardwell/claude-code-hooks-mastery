@@ -314,6 +314,10 @@ When these keywords/phrases are detected, ALWAYS use the specified sub-agent via
 - Keywords: "update session", "session update", "log progress", "record milestone", "track session"
 - Action: Use Task tool with session-manager agent
 
+**Pull Request Creation:**
+- Keywords: "create PR", "pull request", "open PR", "submit for review", "create pull request"
+- Action: Use Task tool with pr-creator agent
+
 ### Sub-Agent Usage Protocol
 1. **ALWAYS prioritize sub-agents over direct tool usage** for specialized operations
 2. **Before using Bash, Edit, or other direct tools**, check if a sub-agent exists for the task type

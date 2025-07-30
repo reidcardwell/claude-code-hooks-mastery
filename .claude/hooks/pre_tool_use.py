@@ -105,8 +105,9 @@ def main():
                 print("BLOCKED: Dangerous rm command detected and prevented", file=sys.stderr)
                 sys.exit(2)  # Exit code 2 blocks tool call and shows error to Claude
         
-        # Ensure log directory exists
-        log_dir = Path.cwd() / 'logs'
+        # Ensure log directory exists in .claude/hooks/logs
+        script_dir = Path(__file__).parent
+        log_dir = script_dir / 'logs'
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / 'pre_tool_use.json'
         

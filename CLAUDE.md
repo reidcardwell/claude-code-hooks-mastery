@@ -284,6 +284,37 @@ task-master models --set-fallback gpt-4o-mini
 }
 ```
 
+## Sub-Agent Trigger Rules
+
+### Automatic Sub-Agent Activation
+When these keywords/phrases are detected, ALWAYS use the specified sub-agent via the Task tool:
+
+**Git Operations:**
+- Keywords: "update git", "commit", "push", "git workflow", "stage changes", "create PR", "merge"
+- Action: Use Task tool with git-flow-automator agent
+
+**Performance Issues:**
+- Keywords: "slow", "performance", "optimize", "bottleneck", "speed up", "improve performance"
+- Action: Use Task tool with performance-optimizer agent
+
+**Work Completion:**
+- Keywords: "tts summary", "audio summary", "work complete", "finished task", "completed work"
+- Action: Use Task tool with enhanced-work-summary agent
+
+**Complex Search/Analysis:**
+- Keywords: "search for", "find in codebase", "multi-step", "analyze system", "comprehensive search"
+- Action: Use Task tool with general-purpose agent
+
+**Task Management Updates:**
+- Keywords: "update task", "modify task", "enhance task", "expand task", "task hierarchy"
+- Action: Use Task tool with taskmaster-task-updater agent
+
+### Sub-Agent Usage Protocol
+1. **ALWAYS prioritize sub-agents over direct tool usage** for specialized operations
+2. **Before using Bash, Edit, or other direct tools**, check if a sub-agent exists for the task type
+3. **Default to Task tool** when the operation matches any trigger keywords above
+4. **Sub-agents provide enhanced capabilities** through specialized knowledge and tool coordination
+
 ## Claude Code Best Practices with Task Master
 
 ### Context Management

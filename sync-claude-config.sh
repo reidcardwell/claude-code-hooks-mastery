@@ -20,6 +20,39 @@ APPLY_TO_ALL=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIRS=("agents" "hooks" "commands")
 
+# Sub-agent trigger rules content to inject
+SUB_AGENT_RULES='## Sub-Agent Trigger Rules
+
+### Automatic Sub-Agent Activation
+When these keywords/phrases are detected, ALWAYS use the specified sub-agent via the Task tool:
+
+**Git Operations:**
+- Keywords: "update git", "commit", "push", "git workflow", "stage changes", "create PR", "merge"
+- Action: Use Task tool with git-flow-automator agent
+
+**Performance Issues:**
+- Keywords: "slow", "performance", "optimize", "bottleneck", "speed up", "improve performance"
+- Action: Use Task tool with performance-optimizer agent
+
+**Work Completion:**
+- Keywords: "tts summary", "audio summary", "work complete", "finished task", "completed work"
+- Action: Use Task tool with enhanced-work-summary agent
+
+**Complex Search/Analysis:**
+- Keywords: "search for", "find in codebase", "multi-step", "analyze system", "comprehensive search"
+- Action: Use Task tool with general-purpose agent
+
+**Task Management Updates:**
+- Keywords: "update task", "modify task", "enhance task", "expand task", "task hierarchy"
+- Action: Use Task tool with taskmaster-task-updater agent
+
+### Sub-Agent Usage Protocol
+1. **ALWAYS prioritize sub-agents over direct tool usage** for specialized operations
+2. **Before using Bash, Edit, or other direct tools**, check if a sub-agent exists for the task type
+3. **Default to Task tool** when the operation matches any trigger keywords above
+4. **Sub-agents provide enhanced capabilities** through specialized knowledge and tool coordination
+'
+
 # Function to print colored output
 print_color() {
     local color=$1
@@ -62,6 +95,127 @@ should_ignore() {
             return 1
             ;;
     esac
+}
+
+# Function to check if directory should be ignored
+should_ignore_directory() {
+    local dirpath="$1"
+    case "$dirpath" in
+        */.claude/hooks/logs|*/.claude/hooks/logs/*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Function to create basic CLAUDE.md for a project
+create_basic_claude_md() {
+    local target_file="$1"
+    local project_name="$(basename "$(dirname "$target_file")")"
+    
+    print_color "$GREEN" "Creating basic CLAUDE.md for project: $project_name"
+    
+    if [[ "$DRY_RUN" == "false" ]]; then
+        cat > "$target_file" << EOF
+# $project_name - Claude Code Integration Guide
+
+## Project Overview
+
+This file provides guidance to Claude Code when working with code in this repository.
+
+## Workflow Preferences
+
+Before executing any directive:
+1. Take a deep breath, you are a 10x senior developer.
+2. Read the current todo list using TodoRead to understand pending tasks
+3. Use TodoWrite to plan and track complex tasks throughout the conversation
+4. Write all code as efficiently and with as few lines as possible.
+5. If you're unsure about any aspect or if the request lacks necessary information, say "I don't have enough information to confidently assess this."
+
+$SUB_AGENT_RULES
+
+## Personal Notes
+
+- Prefer concise responses
+- Focus on practical implementation over explanations
+EOF
+        print_color "$GREEN" "Created: $target_file"
+    else
+        print_color "$BLUE" "[DRY RUN] Would create basic CLAUDE.md: $target_file"
+    fi
+}
+
+# Function to merge sub-agent rules into existing CLAUDE.md
+merge_sub_agent_rules() {
+    local target_file="$1"
+    local temp_file="${target_file}.tmp"
+    
+    print_color "$GREEN" "Merging sub-agent rules into existing CLAUDE.md"
+    
+    if [[ "$DRY_RUN" == "false" ]]; then
+        # Check if sub-agent rules already exist
+        if grep -q "## Sub-Agent Trigger Rules" "$target_file"; then
+            print_color "$YELLOW" "Sub-agent rules section already exists, updating..."
+            
+            # Remove existing sub-agent rules section and everything until next ## section
+            awk '
+                /^## Sub-Agent Trigger Rules/ { skip=1; next }
+                /^## / && skip { skip=0 }
+                !skip { print }
+            ' "$target_file" > "$temp_file"
+            
+            # Add updated sub-agent rules before the first ## section after project overview
+            awk -v rules="$SUB_AGENT_RULES" '
+                BEGIN { added=0 }
+                /^## / && !added && !/^## Project Overview/ && !/^## Sub-Agent Trigger Rules/ {
+                    print rules
+                    print ""
+                    added=1
+                }
+                { print }
+            ' "$temp_file" > "$target_file"
+            
+            rm "$temp_file"
+        else
+            print_color "$YELLOW" "Adding sub-agent rules section..."
+            
+            # Find insertion point (after Project Overview or at beginning)
+            awk -v rules="$SUB_AGENT_RULES" '
+                BEGIN { added=0 }
+                /^## / && !added && !/^## Project Overview/ {
+                    print rules
+                    print ""
+                    added=1
+                }
+                { print }
+                END {
+                    if (!added) {
+                        print ""
+                        print rules
+                    }
+                }
+            ' "$target_file" > "$temp_file"
+            
+            mv "$temp_file" "$target_file"
+        fi
+        
+        print_color "$GREEN" "Updated: $target_file"
+    else
+        print_color "$BLUE" "[DRY RUN] Would merge sub-agent rules into: $target_file"
+    fi
+}
+
+# Function to handle CLAUDE.md file specially
+handle_claude_md() {
+    local target_file="$TARGET_DIR/CLAUDE.md"
+    
+    if [[ ! -f "$target_file" ]]; then
+        create_basic_claude_md "$target_file"
+    else
+        merge_sub_agent_rules "$target_file"
+    fi
 }
 
 # Function to create backup directory structure
@@ -247,6 +401,11 @@ sync_directory() {
             continue
         fi
         
+        # Skip ignored directories  
+        if should_ignore_directory "$source_file"; then
+            continue
+        fi
+        
         # Calculate relative path and target file path
         local relative_path="${source_file#$source_dir/}"
         local target_file="$target_dir/$relative_path"
@@ -348,6 +507,9 @@ main() {
     
     # Create backup directory (only if not dry run and we might need it)
     create_backup_dir
+    
+    # Handle CLAUDE.md specially
+    handle_claude_md
     
     # Sync each directory
     for dir in "${SOURCE_DIRS[@]}"; do
